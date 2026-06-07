@@ -2,7 +2,7 @@
 export PATH=/sbin:/opt/bin:/usr/local/bin:/usr/contrib/bin:/bin:/usr/bin:/usr/sbin:/usr/bin/X11
 
 # ==============================================================================
-# WARPHOLE (Enclave Edition)
+# WARPHOLE
 # Combines Teleporter Backup, Health Monitor, and PADD-based Stats
 # ==============================================================================
 # Usage:

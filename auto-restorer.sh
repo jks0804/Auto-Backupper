@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 export PATH=/sbin:/opt/bin:/usr/local/bin:/usr/contrib/bin:/bin:/usr/bin:/usr/sbin:/usr/bin/X11
 # ==============================================================================
-# AUTO-RESTORER V1.0 [Enterprise Edition]
+# AUTO-RESTORER
 # Companion restore tool for the Auto-Backupper suite
 # ==============================================================================
 #

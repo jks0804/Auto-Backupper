@@ -14,7 +14,7 @@ export PATH=/sbin:/opt/bin:/usr/local/bin:/usr/contrib/bin:/bin:/usr/bin:/usr/sb
 #
 ##
 # ==============================================================================
-# AUTO-BACKUPPER [Enterprise Edition]
+# AUTO-BACKUPPER
 # ==============================================================================
 # A unified, fault-tolerant backup solution for Unraid, OMV, and Linux.
 # ==============================================================================

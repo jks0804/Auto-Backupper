@@ -50,7 +50,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ==============================================================================
-# 1. LOCKING MECHANISM (Mirrors Auto-Backupper V7.3.5)
+# 1. LOCKING MECHANISM (mirrors auto-backupper's lock convention)
 # ==============================================================================
 # We use File Descriptor 9, just like the main script.
 LOCKFD=9

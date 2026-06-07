@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# auto_backupper WATCHTOWER [Enclave Edition - Total Polling]
+# AUTO-BACKUPPER WATCHTOWER
 # ==============================================================================
 # USAGE:
 #   ./watchtower.sh --monitor                # Continuous Daemon
