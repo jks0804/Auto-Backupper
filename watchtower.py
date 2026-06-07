@@ -1124,6 +1124,128 @@ def monitor_loop():
         smart_sleep(interval)
 
 
+def _require_rich():
+    # rich is imported lazily by the TUI commands so the daemon never needs it.
+    try:
+        import rich  # noqa: F401
+        return True
+    except ImportError:
+        print("This view needs the 'rich' package:  pip install rich", file=sys.stderr)
+        return False
+
+
+def _logs_pick_target():
+    # Follow the auto-backupper log while a backup runs, else the watchtower log.
+    if is_backup_running():
+        return BACKUP_LOGFILE, "AUTO-BACKUPPER (Active)"
+    status = ""
+    try:
+        status = open(STATUS_FILE).read().strip()
+    except OSError:
+        pass
+    return WATCHTOWER_LOGFILE, f"WATCHTOWER ({status or 'Idle'})"
+
+
+def _read_tail(path, count):
+    # Last `count` lines + the file's current size (the follow offset).
+    try:
+        with open(path, errors="replace") as f:
+            tail = f.readlines()[-count:]
+        return [ln.rstrip("\n") for ln in tail], os.path.getsize(path)
+    except OSError:
+        return [], 0
+
+
+def _read_since(path, offset):
+    # New content since `offset`; resets to 0 on copytruncate (file shrank).
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], offset
+    if size < offset:
+        offset = 0
+    if size == offset:
+        return [], offset
+    try:
+        with open(path, errors="replace") as f:
+            f.seek(offset)
+            data = f.read()
+            offset = f.tell()
+    except OSError:
+        return [], offset
+    return data.splitlines(), offset
+
+
+def cmd_logs():
+    # Live log monitor that auto-switches between the watchtower and backup logs.
+    from collections import deque
+
+    interactive = sys.stdout.isatty()
+    if not interactive:
+        # Dep-free plain follow for non-TTY (pipes / cron capture).
+        current = None
+        offset = 0
+        try:
+            while True:
+                target, ctx = _logs_pick_target()
+                if target != current:
+                    current = target
+                    print(f">>> CONTEXT: {ctx}  SOURCE: {target}", flush=True)
+                    tail, offset = _read_tail(target, 15)
+                    for ln in tail:
+                        print(ln, flush=True)
+                else:
+                    new, offset = _read_since(target, offset)
+                    for ln in new:
+                        print(ln, flush=True)
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return 0
+
+    if not _require_rich():
+        return 1
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.console import Group
+
+    spin = ["—", "\\", "|", "/"]
+    colors = ["red", "yellow", "green", "cyan", "blue", "magenta"]
+    lines = deque(maxlen=300)
+    current = None
+    offset = 0
+    frame = 0
+    try:
+        with Live(auto_refresh=False, screen=True) as live:
+            while True:
+                target, ctx = _logs_pick_target()
+                if target != current:
+                    current = target
+                    lines.clear()
+                    lines.append(f">>> CONTEXT SWITCH → {ctx}   ({target})")
+                    tail, offset = _read_tail(target, 15)
+                    lines.extend(tail)
+                else:
+                    new, offset = _read_since(target, offset)
+                    lines.extend(new)
+                frame = (frame + 1) % len(spin)
+                color = colors[frame % len(colors)]
+                header = Panel(
+                    Text(f"[{spin[frame]}] WATCHTOWER LIVE LOG — {ctx}   "
+                         f"{datetime.datetime.now().strftime('%H:%M:%S')}", style=f"bold {color}"),
+                    border_style=color,
+                )
+                # Show the tail that fits a typical screen; deque keeps history bounded.
+                body = Text("\n".join(list(lines)[-40:]))
+                live.update(Group(header, Panel(body, title="[q]/Ctrl+C to quit", border_style="grey50")),
+                            refresh=True)
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    log("LOGS: Monitor exited.")
+    return 0
+
+
 def _tui_stub(mode):
     print(f"{mode}: the interactive dashboard is not yet ported to Python.")
     print("Use the bash watchtower for it:  ./watchtower.sh " + mode)
@@ -1223,7 +1345,9 @@ def main():
     # Mode dispatch.
     if mode == "--status":
         sys.exit(cmd_status(daemon_running, daemon_pid))
-    if mode in ("--ab-graph", "--hub", "--logs"):
+    if mode == "--logs":
+        sys.exit(cmd_logs())
+    if mode in ("--ab-graph", "--hub"):
         sys.exit(_tui_stub(mode))
     if mode == "--monitor":
         monitor_loop()
