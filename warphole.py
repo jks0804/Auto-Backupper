@@ -4,11 +4,10 @@ WARPHOLE (Enclave Edition) — Python port
 ==============================================================================
 Combines Teleporter Backup, Health Monitor, and PADD-based Stats for Pi-hole.
 
-A faithful port of warphole.sh. Kept as a SEPARATE script from the bash
-implementation (which remains the primary one on the repo's `bash` branch).
-Where bash shells out to coreutils, this port prefers native Python
-(hashlib for sha256, zipfile for integrity, /proc for memory, requests for
-the API) but mirrors the bash behavior, safety checks, and log conventions.
+A faithful port of warphole.sh, kept as a SEPARATE script from the bash
+implementation (the primary one, on the repo's `bash` branch). Where bash
+shells out to coreutils, this port prefers native Python (hashlib for sha256,
+zipfile for integrity, /proc for memory, requests for the API).
 
 USAGE:
     sudo python3 warphole.py [OPTIONS]
@@ -51,12 +50,9 @@ import subprocess
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
-# `socket.gethostname()` short form, normalised to UPPERCASE — see
-# warphole.sh's matching block for the full rationale. Short version: warphole
-# writes `${HOSTNAME_VAR}_pihole_${CDATE}.zip` into the central NAS; without a
-# canonical case, drifting host casing produces duplicate `<HOST>_pihole_*` and
-# `<host>_pihole_*` siblings that auto-backupper's pull-side retention can't
-# reconcile. Config (secrets.env) can override with HOSTNAME_VAR="my-host".
+# Short hostname, upper-cased so the backup filename
+# (${HOSTNAME_VAR}_pihole_${CDATE}.zip) has a canonical case the central NAS
+# can de-duplicate. secrets.env can override HOSTNAME_VAR.
 _DEFAULT_HOSTNAME = socket.gethostname().split(".")[0].upper()
 
 CONFIG = {
@@ -78,14 +74,14 @@ CONFIG = {
     "SMB_HOST": "127.0.0.1",
     "SMB_SHARE": "backup",
     "SMB_SUBFOLDER": f"services/pihole/{_DEFAULT_HOSTNAME}",
-    # WC5: credentials MUST come from secrets.env. Empty placeholders here so a
-    # fresh clone has no working default password sitting in the script body.
+    # Credentials come from secrets.env; empty here so no default password
+    # lives in the script body.
     "SMB_USER": "",
     "SMB_PASS": "",
     "MOUNT_POINT": "/mnt/backups",
-    # LOCAL_EXPORT_PATH derived AFTER secrets are loaded (see load_secrets()).
+    # Derived in load_secrets() after overrides are applied.
     "LOCAL_EXPORT_PATH": "",
-    # WS4: retention; 0 = keep forever.
+    # Retention in days; 0 = keep forever.
     "WARPHOLE_KEEP_DAYS": 90,
     # --- Tailscale ---
     "CHECK_TAILSCALE": False,
@@ -112,7 +108,7 @@ state = {
     "manage_mount": True,
     "mode": "",
     "lock_fd": None,
-    "log_to_file": True,  # WM1: disabled for stats mode
+    "log_to_file": True,  # false in stats mode (dashboard output is not logged)
 }
 
 # ==============================================================================
@@ -147,8 +143,8 @@ def _parse_value(raw):
 
 
 def load_secrets():
-    """WC5: source an external mode-600 secrets fragment. Any KEY=value here
-    overrides the defaults above. Warn (not fatal) on permission/owner drift."""
+    """Source an external mode-600 secrets fragment; any KEY=value overrides the
+    CONFIG defaults. Warn (not fatal) on permission/owner drift."""
     path = os.environ.get("WARPHOLE_SECRETS_FILE", "/etc/warphole/secrets.env")
     if os.path.isfile(path):
         try:
@@ -182,8 +178,8 @@ def load_secrets():
         except OSError as e:
             print(f"WARN: could not read {path}: {e}", file=sys.stderr)
 
-    # Derive LOCAL_EXPORT_PATH from the final (possibly-overridden) values.
-    # Preserve an explicit LOCAL_EXPORT_PATH override from secrets.env.
+    # Derive from the final (possibly-overridden) values; an explicit
+    # LOCAL_EXPORT_PATH override from secrets.env wins.
     if not CONFIG.get("LOCAL_EXPORT_PATH"):
         CONFIG["LOCAL_EXPORT_PATH"] = (
             f"/mnt/user/{CONFIG['SMB_SHARE']}/{CONFIG['SMB_SUBFOLDER']}"
@@ -217,8 +213,8 @@ def _log_level_for(msg):
 
 
 def rotate_logs(logfile, max_size, backups):
-    """Copytruncate rotation — matches the rest of the suite. Copy then
-    truncate (not move) because callers may hold the file open."""
+    """Copytruncate rotation: copy then truncate (not move) so a held-open log
+    FD keeps writing to the same inode after rotation."""
     if not os.path.isfile(logfile):
         return
     try:
@@ -243,7 +239,7 @@ def rotate_logs(logfile, max_size, backups):
     try:
         shutil.copy2(logfile, f"{logfile}.1")
         open(logfile, "w").close()
-        # WD7: keep live + rotated copies root-only (auth response can be logged).
+        # Live + rotated copies stay root-only (the auth response may be logged).
         os.chmod(logfile, 0o600)
         os.chmod(f"{logfile}.1", 0o600)
     except OSError:
@@ -279,7 +275,7 @@ def dlog(msg):
 def setup_logging():
     try:
         open(CONFIG["LOGFILE"], "a").close()
-        os.chmod(CONFIG["LOGFILE"], 0o600)  # WS14: root-only
+        os.chmod(CONFIG["LOGFILE"], 0o600)  # root-only (auth response may be logged)
     except OSError:
         pass
 
@@ -290,7 +286,7 @@ def setup_logging():
 
 
 def acquire_lock():
-    """WC1: exclusive flock for mutating modes. Skip for stats (read-only)."""
+    """Exclusive flock for mutating modes; stats is read-only and skips it."""
     import fcntl
 
     try:
@@ -303,11 +299,12 @@ def acquire_lock():
     except OSError:
         print("Another warphole instance is running (lockfile held). Exiting.")
         sys.exit(0)
-    state["lock_fd"] = fd  # keep FD alive for process lifetime
+    state["lock_fd"] = fd  # keep the FD alive for the process lifetime
 
 
 def is_gravity_running():
-    """WS3: pidfile-based detection (avoids pgrep -f false positives)."""
+    """Pidfile-based detection of an in-progress gravity update (avoids the
+    pgrep -f false positives that any 'pihole -g' substring would trigger)."""
     pidfile = CONFIG["GRAVITY_PIDFILE"]
     if not os.path.isfile(pidfile):
         return False
@@ -331,7 +328,7 @@ def is_gravity_running():
 
 
 def check_deps(need_rich):
-    """WS8/WM8: only require what the current config/mode actually needs."""
+    """Require only the binaries the current config/mode actually uses."""
     missing_pkgs = []
     try:
         import requests  # noqa: F401
@@ -360,12 +357,12 @@ def check_deps(need_rich):
     if CONFIG["IS_DOCKER"]:
         bins.append("docker")
     else:
-        # WD6: bare metal uses pihole-FTL (backup) and pihole (check).
+        # Bare metal uses pihole-FTL (backup) and pihole (check).
         bins += ["pihole-FTL", "pihole"]
     if CONFIG["DESTINATION_TYPE"] == "smb":
         bins += ["mount.cifs", "findmnt"]
     if CONFIG["CHECK_TAILSCALE"]:
-        bins.append("ping")  # WD8: systemctl is a SOFT dep (guarded)
+        bins.append("ping")  # systemctl is a soft dep, guarded at its call site
     for b in bins:
         if not shutil.which(b):
             print(f"FATAL: Dependency '{b}' is missing. Please install it.")
@@ -373,8 +370,9 @@ def check_deps(need_rich):
 
 
 def authenticate():
-    """WD2: tolerate API/network failures — empty SID, continue (stats/check
-    degrade gracefully). Only fatal in non-stats mode on a real auth rejection."""
+    """Set state['sid'] from the Pi-hole API. Tolerates network/API failures
+    (empty SID, continue) so stats/check degrade gracefully; fatal only in
+    non-stats mode on a genuine auth rejection."""
     import requests
 
     dlog("authenticate entered")
@@ -427,7 +425,7 @@ def _safe_remove(path):
 
 
 def mount_smb():
-    # WC5: fail fast on missing credentials with an actionable message.
+    # Fail fast on missing credentials with an actionable message.
     if not CONFIG["SMB_USER"] or not CONFIG["SMB_PASS"]:
         secrets = os.environ.get("WARPHOLE_SECRETS_FILE", "/etc/warphole/secrets.env")
         log("FATAL: SMB_USER or SMB_PASS is empty.")
@@ -440,7 +438,7 @@ def mount_smb():
 
     if os.path.ismount(mp):
         log(f"INFO: Mount point {mp} is already active.")
-        # WM9: verify it's mounted from the expected source.
+        # Verify it's mounted from the expected source before writing into it.
         try:
             current = subprocess.check_output(
                 ["findmnt", "-n", "-o", "SOURCE", mp], text=True
@@ -456,8 +454,8 @@ def mount_smb():
     os.makedirs(mp, exist_ok=True)
     log(f"ACTION: Mounting {expected}...")
 
-    # WC3: pass credentials via a mode-0600 temp file, not -o options (which
-    # would expose the password in `ps`). Shred/remove immediately after.
+    # Pass credentials via a mode-0600 temp file (keeps the password out of
+    # `ps`, unlike -o options); shred/remove it immediately after the mount.
     fd, creds = tempfile.mkstemp(prefix="warphole_creds.")
     try:
         os.fchmod(fd, 0o600)
@@ -484,9 +482,8 @@ def mount_smb():
     if rc.returncode == 0:
         log("SUCCESS: Share mounted.")
     else:
-        # Do NOT log rc.stderr at info level: mount.cifs error text can echo the
-        # temporary credentials file path. Match bash (exit code only); surface
-        # stderr under DEBUG_MODE for diagnosis.
+        # Log the exit code only — mount.cifs error text can echo the temporary
+        # credentials file path. The stderr goes to the debug log instead.
         log(f"FATAL: Failed to mount SMB share (exit code {rc.returncode}).")
         dlog(f"mount.cifs stderr: {rc.stderr.strip()}")
         sys.exit(1)
@@ -498,8 +495,9 @@ def mount_smb():
 
 
 def run_gravity_rebuild(label):
-    """WS16: route the firehose of `pihole -g` output to GRAVITY_LOG instead of
-    the script's stdout (which can OOM/SIGPIPE on low-memory hosts). Returns rc."""
+    """Run `pihole -g` with output routed to GRAVITY_LOG instead of the script's
+    stdout (the firehose can OOM/SIGPIPE on the low-memory hosts that need a
+    rebuild most). Logs a one-line summary + 3-line tail. Returns the rc."""
     glog = CONFIG["GRAVITY_LOG"]
     if CONFIG["IS_DOCKER"]:
         cmd = ["docker", "exec", CONFIG["DOCKER_CONTAINER_NAME"], "pihole", "-g"]
@@ -523,7 +521,7 @@ def run_gravity_rebuild(label):
 
 
 def ensure_pihole_running():
-    """WS7: confirm the container is Running before docker exec / API use."""
+    """Confirm the container is Running before docker exec / API use."""
     if not CONFIG["IS_DOCKER"]:
         return True
     if not shutil.which("docker"):
@@ -553,7 +551,7 @@ def sha256_file(path):
 
 
 def zip_integrity_ok(path):
-    """WM11: native equivalent of `unzip -t`."""
+    """Native equivalent of `unzip -t` — True if the archive is intact."""
     try:
         with zipfile.ZipFile(path) as z:
             return z.testzip() is None
@@ -576,7 +574,7 @@ def run_backup():
     else:
         final_dest = CONFIG["LOCAL_EXPORT_PATH"]
         state["manage_mount"] = False
-    final_dest = final_dest.rstrip("/")  # WM10
+    final_dest = final_dest.rstrip("/")  # avoid '//' in the joined target path
 
     if not os.path.isdir(final_dest):
         try:
@@ -598,8 +596,8 @@ def run_backup():
         name = CONFIG["DOCKER_CONTAINER_NAME"]
         log(f"Action: Running pihole-FTL inside container '{name}'...")
 
-        # WS11/WS15: capture the generated filename from pihole-FTL stdout,
-        # isolating the teleporter zip line (FTL v6 prints config noise first).
+        # Capture the generated filename from pihole-FTL stdout, isolating the
+        # teleporter zip line (FTL v6 prints config-parsing noise first).
         raw = subprocess.run(
             ["docker", "exec", "-w", "/tmp", name, "pihole-FTL", "--teleporter"],
             capture_output=True, text=True, stderr=subprocess.DEVNULL,
@@ -621,7 +619,7 @@ def run_backup():
             sys.exit(1)
 
         log(f"Action: Copying {docker_file} from container to host...")
-        # WS12: clean up the container-side zip even if docker cp fails.
+        # Clean up the container-side zip even if docker cp fails.
         if subprocess.run(["docker", "cp", f"{name}:{docker_file}", CONFIG["TEMP_DIR"] + "/"]).returncode != 0:
             log("ERROR: docker cp failed — cleaning up container-side zip before exit")
             subprocess.run(["docker", "exec", name, "rm", "-f", docker_file],
@@ -629,7 +627,8 @@ def run_backup():
             sys.exit(1)
         subprocess.run(["docker", "exec", name, "rm", "-f", docker_file], stderr=subprocess.DEVNULL)
     else:
-        # WD5: guard FTL failure so it logs FATAL instead of a silent abort.
+        # Bare metal: capture FTL's stderr and surface a FATAL on failure
+        # rather than aborting silently.
         err_path = os.path.join(CONFIG["TEMP_DIR"], ".ftl_err")
         try:
             with open(err_path, "w") as err:
@@ -665,7 +664,8 @@ def run_backup():
     log(f"Source: {gen_file}")
     log(f"Target: {target_path}")
 
-    # WM2: atomic write — copy to temp, then rename.
+    # Atomic write: copy to a temp name, then rename — observers see either the
+    # previous file or the complete new one, never a partial write.
     target_tmp = target_path + ".tmp"
     try:
         shutil.copy2(gen_file, target_tmp)
@@ -686,7 +686,7 @@ def run_backup():
         log(f"ERROR: Checksum mismatch! ({loc_sum} vs {rem_sum})")
         sys.exit(1)
 
-    # WM11: zip-internal integrity check (native zipfile).
+    # Internal zip integrity check (defends against a corrupt-but-copied zip).
     if not zip_integrity_ok(target_path):
         log("ERROR: Destination zip failed integrity test (zipfile)")
         _safe_remove(target_path)
@@ -694,8 +694,8 @@ def run_backup():
     log("VERIFIED: Zip integrity OK")
 
     # --- 4b. Persist dated checksum under .checksums/ ---
-    # Mirrors auto-backupper's layout so the central NAS pull-side retention
-    # can read this file's discovery date from the "_<YYYYMMDD>.sha256" suffix:
+    # Layout mirrors auto-backupper so the central NAS pull-side retention can
+    # read this file's discovery date from the "_<YYYYMMDD>.sha256" suffix:
     #   <BACKUP_ROOT>/<SMB_SUBFOLDER>/<name>.zip
     #   <BACKUP_ROOT>/.checksums/<SMB_SUBFOLDER>/<name>.zip_<CDATE>.sha256
     if CONFIG["DESTINATION_TYPE"] == "smb":
@@ -710,7 +710,7 @@ def run_backup():
     except OSError:
         log(f"WARN: Could not create checksum dir {chk_subdir} — skipping dated checksum write")
     else:
-        # Sweep any stale dated sibling — one dated checksum per data file.
+        # One dated checksum per data file — sweep stale dated siblings first.
         for stale in glob.glob(os.path.join(chk_subdir, target_name + "_" + "[0-9]" * 8 + ".sha256")):
             _safe_remove(stale)
         # Atomic write: temp + rename.
@@ -724,7 +724,7 @@ def run_backup():
             log(f"WARN: Failed to write checksum into place: {chk_path}")
             _safe_remove(tmp)
 
-    # --- 4c. Retention (WS4) ---
+    # --- 4c. Retention ---
     keep_days = CONFIG.get("WARPHOLE_KEEP_DAYS", 0)
     if keep_days and keep_days > 0:
         log(f"Phase: Rotation (keeping last {keep_days} days)")
@@ -738,6 +738,7 @@ def run_backup():
                 continue
             _safe_remove(old)
             deleted += 1
+            # Drop the deleted backup's dated checksum sibling too.
             old_name = os.path.basename(old)
             for old_chk in glob.glob(os.path.join(chk_subdir, old_name + "_" + "[0-9]" * 8 + ".sha256")):
                 _safe_remove(old_chk)
@@ -773,7 +774,7 @@ def verify_tailscale_network():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ).returncode == 0
 
-    # WS5: retry before restarting (a restart tears down all connections).
+    # Retry before restarting — a restart tears down all active connections.
     for attempt in range(3):
         if ping_once():
             log(f"HEALTHY: Tailscale network is reachable ({ip}).")
@@ -782,7 +783,7 @@ def verify_tailscale_network():
             time.sleep(3)
 
     log("WARNING: Tailscale unreachable after 3 attempts. Restarting tailscaled service...")
-    # WD8: guard the restart so a non-systemd host warns and continues.
+    # Guarded so a non-systemd host warns and continues instead of erroring.
     if shutil.which("systemctl") and subprocess.run(
         ["systemctl", "restart", "tailscaled"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -798,7 +799,8 @@ def verify_tailscale_network():
 
 
 def _gravity_size(data):
-    """Mirror bash: null/missing -> 0; negative (e.g. -2 corrupt) -> -1 (invalid)."""
+    """gravity_size as an int: null/missing -> 0; negative (e.g. -2 corrupt) ->
+    -1 (an invalid value the caller treats as 'force rebuild')."""
     gv = data.get("gravity_size", 0)
     if isinstance(gv, bool):
         return 0
@@ -828,7 +830,7 @@ def run_health_check():
         log("SUCCESS: Recovery gravity pull complete. Marker removed.")
         return
 
-    # WS7: container up before API.
+    # Container must be up before we touch the API.
     if not ensure_pihole_running():
         sys.exit(1)
 
@@ -841,13 +843,14 @@ def run_health_check():
     if data is None:
         log("WARN: /padd request failed — treating API as down.")
 
-    # WS9: empty/invalid -> force rebuild path.
+    # Empty/invalid JSON -> force the rebuild path.
     if not isinstance(data, dict):
         log("WARN: API returned empty/invalid JSON — treating as corrupt-DB and forcing rebuild.")
         raw_gravity = "<invalid>"
         domains = 0
     else:
-        # WD4: distinguish a 401 error body from an empty/corrupt gravity DB.
+        # A 401 error body means auth is required, NOT that gravity is empty —
+        # never rebuild on this, or a wrong PI_PASSWORD would wipe gravity.
         if "error" in data:
             err = data.get("error")
             log(f"ERROR: /padd returned an API error: {err}.")
@@ -888,7 +891,8 @@ def run_health_check():
 
     # --- Conditional repair ---
     if CONFIG["IS_DOCKER"]:
-        # WS2: restart container, wait for readiness, retry gravity once.
+        # Restart the container to clear its state, wait for readiness, then
+        # retry the rebuild once and re-verify.
         name = CONFIG["DOCKER_CONTAINER_NAME"]
         log("ACTION: Restarting pihole container to clear its state...")
         if subprocess.run(["docker", "restart", name],
@@ -909,7 +913,7 @@ def run_health_check():
         run_gravity_rebuild("post-restart retry")
         time.sleep(3)
 
-        # Re-authenticate (SID does not survive FTL restart) and re-verify.
+        # The SID does not survive an FTL restart — re-authenticate, re-verify.
         state["sid"] = ""
         authenticate()
         retry_data = api_get_padd(timeout=10)
@@ -923,6 +927,7 @@ def run_health_check():
     else:
         ram = total_ram_mb()
         if ram < 1024:
+            # Low-RAM bare metal: a rebuild often needs a clean boot to free RAM.
             log(f"ACTION: Low memory bare-metal system ({ram} MB). Rebooting to clear RAM for gravity...")
             try:
                 open(CONFIG["REPAIR_MARKER"], "w").close()
@@ -943,7 +948,7 @@ def run_health_check():
 
 
 def trigger_gravity_bg():
-    """WS3: launch `pihole -g` detached, record pid for is_gravity_running()."""
+    """Launch `pihole -g` detached and record its pid for is_gravity_running()."""
     if is_gravity_running():
         return
     try:
@@ -995,7 +1000,8 @@ def run_stats():
     from rich.table import Table
     from rich.console import Group
 
-    # WM3: validate REFRESH_RATE (used as the keypress timeout).
+    # REFRESH_RATE is reused as the keypress timeout; a bad value would break
+    # the read, so validate and fall back to 2.
     rr = CONFIG["REFRESH_RATE"]
     if not isinstance(rr, int) or rr < 1:
         print(f"WARN: REFRESH_RATE='{rr}' is not a positive integer, defaulting to 2.")
@@ -1005,7 +1011,8 @@ def run_stats():
 
     authenticate()
 
-    # WM4: one-shot PADD schema drift check before the screen takes over.
+    # One-shot PADD schema-drift probe before the screen takes over, so a
+    # renamed field shows a warning instead of silently rendering 0s.
     probe = api_get_padd(timeout=5)
     if isinstance(probe, dict):
         checks = {
@@ -1023,7 +1030,7 @@ def run_stats():
             print("      Dashboard will show 0 for those metrics. Starting in 3s...")
             time.sleep(3)
 
-    # Non-blocking single-key reader (q/u) doubling as the refresh delay.
+    # Non-blocking single-key reader (q/u) that doubles as the refresh delay.
     interactive = sys.stdin.isatty()
     old_term = None
     if interactive:
@@ -1075,18 +1082,18 @@ def run_stats():
         except (TypeError, ValueError):
             mem_used_mb = mem_total_mb = 0
 
-        # QPS
+        # QPS over the refresh interval; guard against an API counter reset.
         qps = 0.0
         if counters["first_run"]:
             counters["first_run"] = False
         else:
             diff = total - counters["prev_queries"]
             if diff < 0:
-                diff = 0  # guard against API counter reset
+                diff = 0
             qps = round(diff / refresh, 1)
         counters["prev_queries"] = total
 
-        # Gravity status
+        # Gravity status: live tail of GRAVITY_LOG while a rebuild is running.
         if is_gravity_running():
             grav_status = Text("⚡ UPDATING", style="yellow")
             try:
@@ -1172,12 +1179,11 @@ def run_stats():
                 except KeyboardInterrupt:
                     break
                 except Exception:
-                    # Flaky network/parse — keep the dashboard alive (WS6).
+                    # Flaky network/parse — keep the dashboard alive.
                     time.sleep(refresh)
     finally:
-        # Ensure the cursor is visible again even on an unclean exit — mirrors
-        # bash's `tput cnorm` in cleanup() (rich usually restores it, but this
-        # is a cheap belt-and-suspenders for Ctrl+C / exception paths).
+        # Make sure the cursor is visible again on exit (rich usually restores
+        # it; this also covers Ctrl+C / exception paths).
         try:
             sys.stdout.write("\033[?25h")
             sys.stdout.flush()
@@ -1212,7 +1218,7 @@ def cleanup():
                 subprocess.run(["umount", "-l", CONFIG["MOUNT_POINT"]],
                                stderr=subprocess.DEVNULL)
 
-    # WM13: best-effort logout with a short timeout; swallow errors.
+    # Best-effort logout with a short timeout; swallow errors.
     if state["sid"]:
         try:
             import requests
@@ -1252,13 +1258,13 @@ def main():
 
     load_secrets()
 
-    # WM6: short-circuit --help / -h BEFORE the dependency check.
+    # Handle --help / -h before the dependency check so help works without deps.
     args = [a for a in sys.argv[1:] if a != ""]
     if any(a in ("--help", "-h") for a in args):
         print_usage()
         sys.exit(0)
 
-    # WM1: determine stats-ness from ALL args; disables file logging.
+    # Stats mode disables file logging; detect it from any arg (or DEFAULT_MODE).
     stats_mode = CONFIG["DEFAULT_MODE"] == "stats" or "--stats" in args
     state["log_to_file"] = not stats_mode
     if not stats_mode:
@@ -1286,7 +1292,7 @@ def main():
             elif a == "--stats":
                 state["mode"] = "stats"
             elif a == "--mount-only":
-                acquire_lock()  # WC1: mounting mutates system state
+                acquire_lock()  # mounting mutates system state
                 mount_smb()
                 state["manage_mount"] = False  # hold the mount
                 sys.exit(0)
@@ -1302,7 +1308,7 @@ def main():
                 print_usage()
                 sys.exit(1)
 
-    # Route execution. WC1: lock for mutating modes; stats runs read-only.
+    # Route execution: lock for mutating modes; stats runs read-only.
     if state["mode"] == "backup":
         acquire_lock()
         run_backup()
