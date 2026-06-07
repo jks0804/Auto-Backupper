@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""
-WARPHOLE (Enclave Edition) — Python port
-==============================================================================
-Combines Teleporter Backup, Health Monitor, and PADD-based Stats for Pi-hole.
-
-A faithful port of warphole.sh, kept as a SEPARATE script from the bash
-implementation (the primary one, on the repo's `bash` branch). Where bash
-shells out to coreutils, this port prefers native Python (hashlib for sha256,
-zipfile for integrity, /proc for memory, requests for the API).
-
-USAGE:
-    sudo python3 warphole.py [OPTIONS]
-
-Primary modes:
-    --backup-now    Run Pi-hole Teleporter backup and offload to destination
-    --check         Run health check (gravity + optional Tailscale)
-    --stats         Launch terminal dashboard
-    --help, -h      Show this help
-
-Advanced:
-    --mount-only    Mount SMB share only (holds the mount; skips unmount on exit)
-    --unmount-only  Unmount SMB share only
-    --keep-local    Keep temp staging files (debug)
-
-CONFIGURATION:
-    Defaults live in CONFIG below. Override (and supply credentials) via an
-    external secrets file — /etc/warphole/secrets.env by default, or
-    $WARPHOLE_SECRETS_FILE — a plain `KEY="value"` fragment, mode 600.
-
-DEPENDENCIES:
-    Python 3.6+, packages: requests (check/stats), rich (stats).
-    Binaries: docker (if IS_DOCKER) or pihole-FTL/pihole (bare metal);
-    mount.cifs + findmnt (if SMB); ping (if CHECK_TAILSCALE).
-"""
+# WARPHOLE (Enclave Edition) — Python port
+# ==============================================================================
+# Combines Teleporter Backup, Health Monitor, and PADD-based Stats for Pi-hole.
+#
+# A faithful port of warphole.sh, kept as a SEPARATE script from the bash
+# implementation (the primary one, on the repo's `bash` branch). Where bash
+# shells out to coreutils, this port prefers native Python (hashlib for sha256,
+# zipfile for integrity, /proc for memory, requests for the API).
+#
+# USAGE:
+#     sudo python3 warphole.py [OPTIONS]
+#
+# Primary modes:
+#     --backup-now    Run Pi-hole Teleporter backup and offload to destination
+#     --check         Run health check (gravity + optional Tailscale)
+#     --stats         Launch terminal dashboard
+#     --help, -h      Show this help
+#
+# Advanced:
+#     --mount-only    Mount SMB share only (holds the mount; skips unmount on exit)
+#     --unmount-only  Unmount SMB share only
+#     --keep-local    Keep temp staging files (debug)
+#
+# CONFIGURATION:
+#     Defaults live in CONFIG below. Override (and supply credentials) via an
+#     external secrets file — /etc/warphole/secrets.env by default, or
+#     $WARPHOLE_SECRETS_FILE — a plain `KEY="value"` fragment, mode 600.
+#
+# DEPENDENCIES:
+#     Python 3.6+, packages: requests (check/stats), rich (stats).
+#     Binaries: docker (if IS_DOCKER) or pihole-FTL/pihole (bare metal);
+#     mount.cifs + findmnt (if SMB); ping (if CHECK_TAILSCALE).
 
 import os
 import sys
@@ -117,7 +115,7 @@ state = {
 
 
 def _coerce(key, raw):
-    """Coerce a string value from secrets.env to the type of CONFIG[key]."""
+    # Coerce a string value from secrets.env to the type of CONFIG[key].
     default = CONFIG.get(key)
     if isinstance(default, bool):
         return str(raw).strip().lower() == "true"
@@ -130,7 +128,7 @@ def _coerce(key, raw):
 
 
 def _parse_value(raw):
-    """Extract a bash-fragment RHS value, preserving '#' inside quotes."""
+    # Extract a bash-fragment RHS value, preserving '#' inside quotes.
     raw = raw.strip()
     if raw and raw[0] in ("'", '"'):
         q = raw[0]
@@ -143,8 +141,8 @@ def _parse_value(raw):
 
 
 def load_secrets():
-    """Source an external mode-600 secrets fragment; any KEY=value overrides the
-    CONFIG defaults. Warn (not fatal) on permission/owner drift."""
+    # Source an external mode-600 secrets fragment; any KEY=value overrides the
+    # CONFIG defaults. Warn (not fatal) on permission/owner drift.
     path = os.environ.get("WARPHOLE_SECRETS_FILE", "/etc/warphole/secrets.env")
     if os.path.isfile(path):
         try:
@@ -213,8 +211,8 @@ def _log_level_for(msg):
 
 
 def rotate_logs(logfile, max_size, backups):
-    """Copytruncate rotation: copy then truncate (not move) so a held-open log
-    FD keeps writing to the same inode after rotation."""
+    # Copytruncate rotation: copy then truncate (not move) so a held-open log
+    # FD keeps writing to the same inode after rotation.
     if not os.path.isfile(logfile):
         return
     try:
@@ -267,7 +265,7 @@ def log(msg):
 
 
 def dlog(msg):
-    """Debug-only logger; visible only at LOG_VERBOSITY=debug with DEBUG_MODE."""
+    # Debug-only logger; visible only at LOG_VERBOSITY=debug with DEBUG_MODE.
     if CONFIG.get("DEBUG_MODE"):
         log("DEBUG: " + msg)
 
@@ -286,7 +284,7 @@ def setup_logging():
 
 
 def acquire_lock():
-    """Exclusive flock for mutating modes; stats is read-only and skips it."""
+    # Exclusive flock for mutating modes; stats is read-only and skips it.
     import fcntl
 
     try:
@@ -303,8 +301,8 @@ def acquire_lock():
 
 
 def is_gravity_running():
-    """Pidfile-based detection of an in-progress gravity update (avoids the
-    pgrep -f false positives that any 'pihole -g' substring would trigger)."""
+    # Pidfile-based detection of an in-progress gravity update (avoids the
+    # pgrep -f false positives that any 'pihole -g' substring would trigger).
     pidfile = CONFIG["GRAVITY_PIDFILE"]
     if not os.path.isfile(pidfile):
         return False
@@ -328,7 +326,7 @@ def is_gravity_running():
 
 
 def check_deps(need_rich):
-    """Require only the binaries the current config/mode actually uses."""
+    # Require only the binaries the current config/mode actually uses.
     missing_pkgs = []
     try:
         import requests  # noqa: F401
@@ -370,9 +368,9 @@ def check_deps(need_rich):
 
 
 def authenticate():
-    """Set state['sid'] from the Pi-hole API. Tolerates network/API failures
-    (empty SID, continue) so stats/check degrade gracefully; fatal only in
-    non-stats mode on a genuine auth rejection."""
+    # Set state['sid'] from the Pi-hole API. Tolerates network/API failures
+    # (empty SID, continue) so stats/check degrade gracefully; fatal only in
+    # non-stats mode on a genuine auth rejection.
     import requests
 
     dlog("authenticate entered")
@@ -401,7 +399,7 @@ def authenticate():
 
 
 def api_get_padd(timeout=10):
-    """GET /padd. Returns parsed JSON dict, or None on network/parse failure."""
+    # GET /padd. Returns parsed JSON dict, or None on network/parse failure.
     import requests
 
     headers = {"X-FTL-SID": state["sid"]} if state["sid"] else {}
@@ -495,9 +493,9 @@ def mount_smb():
 
 
 def run_gravity_rebuild(label):
-    """Run `pihole -g` with output routed to GRAVITY_LOG instead of the script's
-    stdout (the firehose can OOM/SIGPIPE on the low-memory hosts that need a
-    rebuild most). Logs a one-line summary + 3-line tail. Returns the rc."""
+    # Run `pihole -g` with output routed to GRAVITY_LOG instead of the script's
+    # stdout (the firehose can OOM/SIGPIPE on the low-memory hosts that need a
+    # rebuild most). Logs a one-line summary + 3-line tail. Returns the rc.
     glog = CONFIG["GRAVITY_LOG"]
     if CONFIG["IS_DOCKER"]:
         cmd = ["docker", "exec", CONFIG["DOCKER_CONTAINER_NAME"], "pihole", "-g"]
@@ -521,7 +519,7 @@ def run_gravity_rebuild(label):
 
 
 def ensure_pihole_running():
-    """Confirm the container is Running before docker exec / API use."""
+    # Confirm the container is Running before docker exec / API use.
     if not CONFIG["IS_DOCKER"]:
         return True
     if not shutil.which("docker"):
@@ -551,7 +549,7 @@ def sha256_file(path):
 
 
 def zip_integrity_ok(path):
-    """Native equivalent of `unzip -t` — True if the archive is intact."""
+    # Native equivalent of `unzip -t` — True if the archive is intact.
     try:
         with zipfile.ZipFile(path) as z:
             return z.testzip() is None
@@ -799,8 +797,8 @@ def verify_tailscale_network():
 
 
 def _gravity_size(data):
-    """gravity_size as an int: null/missing -> 0; negative (e.g. -2 corrupt) ->
-    -1 (an invalid value the caller treats as 'force rebuild')."""
+    # gravity_size as an int: null/missing -> 0; negative (e.g. -2 corrupt) ->
+    # -1 (an invalid value the caller treats as 'force rebuild').
     gv = data.get("gravity_size", 0)
     if isinstance(gv, bool):
         return 0
@@ -948,7 +946,7 @@ def run_health_check():
 
 
 def trigger_gravity_bg():
-    """Launch `pihole -g` detached and record its pid for is_gravity_running()."""
+    # Launch `pihole -g` detached and record its pid for is_gravity_running().
     if is_gravity_running():
         return
     try:
@@ -984,7 +982,7 @@ def _draw_bar(pct, width):
 
 
 def _g(data, path, default=0):
-    """Safe nested lookup over a dict path like ['system','memory','ram','used']."""
+    # Safe nested lookup over a dict path like ['system','memory','ram','used'].
     cur = data
     for k in path:
         if not isinstance(cur, dict) or k not in cur:
