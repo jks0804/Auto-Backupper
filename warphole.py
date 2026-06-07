@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# WARPHOLE (Enclave Edition) — Python port
+# WARPHOLE
 # ==============================================================================
 # Combines Teleporter Backup, Health Monitor, and PADD-based Stats for Pi-hole.
 #

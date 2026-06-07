@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# AUTO-RESTORER [Enterprise Edition] — Python port
+# AUTO-RESTORER
 # Companion restore tool for the Auto-Backupper suite
 # ==============================================================================
 # A faithful port of auto-restorer.sh (the primary version lives on the repo's

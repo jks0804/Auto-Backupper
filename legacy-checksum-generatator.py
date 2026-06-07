@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# AUTO-BACKUPPER LEGACY CHECKSUM GENERATOR — Python port
+# AUTO-BACKUPPER LEGACY CHECKSUM GENERATOR
 # ==============================================================================
 # Usage: sudo python3 legacy-checksum-generatator.py [BACKUP_PATH] [--force]
 #

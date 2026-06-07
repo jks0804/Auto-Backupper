@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# AUTO-BACKUPPER [Enterprise Edition] — Python port
+# AUTO-BACKUPPER
 # ==============================================================================
 # A unified, fault-tolerant backup solution for Unraid, OMV, and Linux.
 #

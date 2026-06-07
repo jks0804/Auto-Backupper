@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# auto_backupper WATCHTOWER [Enclave Edition] — Python port
+# AUTO-BACKUPPER WATCHTOWER
 # ==============================================================================
 # Daemon that monitors, schedules, and protects backup integrity for the
 # Auto-Backupper suite. A faithful port of watchtower.sh (the primary

@@ -1,13 +1,13 @@
 * * * * *
 
-Auto-Backupper — Python Edition
-================================
+Auto-Backupper
+==============
 
 **A Unified, Fault-Tolerant Backup & Maintenance Suite for Unraid, OMV, and Linux**
 
 This is the **Python port** of Auto-Backupper, a faithful reimplementation of the original
 Bash suite (which lives on the [`main`](../../tree/main) branch and remains the primary,
-production-grade implementation). The Python edition trades the Bash suite's breadth for a
+production-grade implementation). This port trades the Bash suite's breadth for a
 leaner, dependency-light codebase that is easier to read, extend, and run anywhere Python 3.6+
 is available.
 
@@ -44,12 +44,14 @@ is available.
 📦 Components
 ------------
 
-| Script              | Version                 | Purpose                                                              |
-|---------------------|-------------------------|----------------------------------------------------------------------|
-| `auto-backupper.py` | V8.6.4 [Enclave Edition]| Produce local backups (system, shares, DB dumps) and/or pull remotes |
-| `watchtower.py`     | V8.6 (Python Edition)   | Scheduling daemon, integrity scanner, cache monitor, Docker updater  |
-| `warphole.py`       | v3.2 (Python Edition)   | Pi-hole sidecar: Teleporter backup, gravity health-check, live stats |
-| `auto_backupper.cfg`| —                       | Shared configuration (Bash-syntax `KEY=val` / `KEY=(arrays)`)        |
+| Script              | Purpose                                                              |
+|---------------------|----------------------------------------------------------------------|
+| `auto-backupper.py` | Produce local backups (system, shares, DB dumps) and/or pull remotes |
+| `watchtower.py`     | Scheduling daemon, integrity scanner, cache monitor, Docker updater  |
+| `warphole.py`       | Pi-hole sidecar: Teleporter backup, gravity health-check, live stats |
+| `auto-restorer.py`  | Disaster recovery: list/inspect/verify/restore, corruption report    |
+| `legacy-checksum-generatator.py` | Back-fill dated checksums for existing archives         |
+| `auto_backupper.cfg`| Shared configuration (Bash-syntax `KEY=val` / `KEY=(arrays)`)        |
 
 * * * * *
 
