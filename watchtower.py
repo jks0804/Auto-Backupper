@@ -83,6 +83,7 @@ CONFIG = {
     "CHECKSUM_DIR": ".checksums",
     "SHARES_BASE_FOLDER": "/mnt/user",
     "MAIN_BACKUP_SCRIPT": "/usr/local/bin/auto_backupper.sh",
+    "MAIN_RESTORER_SCRIPT": "",  # auto-located by --hub if empty
     "MONITOR_INTERVAL": "300",
     "WATCHTOWER_GRAPH_REFRESH": "1",  # --ab-graph dashboard refresh (seconds)
     "CPU_THREADS": "1",
@@ -1747,9 +1748,375 @@ def cmd_ab_graph(daemon_running, daemon_pid):
     return 0
 
 
-def _tui_stub(mode):
-    print(f"{mode}: the interactive dashboard is not yet ported to Python.")
-    print("Use the bash watchtower for it:  ./watchtower.sh " + mode)
+# ==============================================================================
+# --hub COMMAND CENTER
+# ==============================================================================
+
+
+def _hub_find_restorer():
+    # MAIN_RESTORER_SCRIPT first; else probe next to us and around
+    # MAIN_BACKUP_SCRIPT (parent + grandparent), accepting .py or .sh.
+    mr = cfg("MAIN_RESTORER_SCRIPT")
+    if mr and os.path.isfile(mr):
+        return mr
+    cands = []
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    cands += [os.path.join(here, "auto-restorer.py"), os.path.join(here, "auto-restorer.sh")]
+    script = cfg("MAIN_BACKUP_SCRIPT")
+    if script:
+        bp = os.path.dirname(script)
+        gp = os.path.dirname(bp)
+        for d in (bp, gp):
+            cands += [os.path.join(d, "auto-restorer.py"), os.path.join(d, "auto-restorer.sh")]
+    cands += ["/usr/local/bin/auto-restorer.py", "/usr/local/bin/auto-restorer.sh",
+              "/usr/local/sbin/auto-restorer.py", "/usr/local/sbin/auto-restorer.sh"]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _launch_argv(script, extra):
+    # Run a .py via the current interpreter; anything else directly.
+    return ([sys.executable, script] if script.endswith(".py") else [script]) + extra
+
+
+def cmd_hub(daemon_running, daemon_pid):
+    # Houston-style command center: a live header + single-key shortcuts to every
+    # watchtower / backupper / restorer entry point, with --ab-graph/--logs/
+    # --status as sub-screens. Renders fresh each tick (no persistent alt-screen)
+    # so sub-views that own the screen compose cleanly.
+    if not sys.stdout.isatty():
+        print("--hub requires an interactive terminal.")
+        return 1
+    if not _require_rich():
+        return 1
+    import termios
+    import tty
+    import select
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console()
+    fd = sys.stdin.fileno()
+    old_term = termios.tcgetattr(fd)
+    st = {"running": daemon_running, "pid": daemon_pid}
+
+    def enter_raw():
+        try:
+            tty.setcbreak(fd)
+        except Exception:
+            pass
+
+    def leave_raw():
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+        except Exception:
+            pass
+
+    def redetect():
+        st["running"], st["pid"] = _detect_daemon()
+
+    def read_key(timeout):
+        dr, _, _ = select.select([sys.stdin], [], [], timeout)
+        return sys.stdin.read(1) if dr else None
+
+    def notice(msg):
+        console.print(f"  >> {msg}", style="yellow")
+        time.sleep(2)
+
+    def confirm(msg):
+        sys.stdout.write(f"  ?? {msg} [y/N]: ")
+        sys.stdout.flush()
+        return sys.stdin.read(1) in ("y", "Y")
+
+    def prompt(msg):
+        leave_raw()
+        try:
+            val = input(f"  {msg}: ")
+        except EOFError:
+            val = ""
+        enter_raw()
+        return val.strip()
+
+    def pause():
+        sys.stdout.write("\n  Press any key to return to the hub...")
+        sys.stdout.flush()
+        # cbreak for the read so any single key returns (not just Enter); callers
+        # run this in cooked mode, so restore cooked afterward.
+        enter_raw()
+        try:
+            sys.stdin.read(1)
+        finally:
+            leave_raw()
+
+    def run_screen(fn):
+        # Full-screen sub-view that manages its own screen and returns on quit.
+        leave_raw()
+        try:
+            fn()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"  sub-view error: {e}")
+        enter_raw()
+
+    def run_output(fn):
+        # Command whose output we show, then pause before returning to the hub.
+        leave_raw()
+        console.clear()
+        try:
+            fn()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"  sub-view error: {e}")
+        try:
+            pause()
+        except KeyboardInterrupt:
+            pass
+        enter_raw()
+
+    def age(path):
+        try:
+            return _format_age_days(open(path).read().strip())
+        except OSError:
+            return "never"
+
+    def signal_action(action, label):
+        if not confirm(f"Trigger {label}?"):
+            return
+        if not st["running"]:
+            notice("Daemon not running — nothing to signal.")
+            return
+        trig = {"cleanup": TRIGGER_CLEANUP, "scan": TRIGGER_SCAN, "verify": TRIGGER_VERIFY,
+                "update": TRIGGER_UPDATE, "reload": TRIGGER_CONFIG}[action]
+        try:
+            with open(trig, "w") as f:
+                if action == "reload":
+                    f.write(CFG_TO_LOAD)
+        except OSError:
+            pass
+        if st["pid"]:
+            try:
+                os.kill(int(st["pid"]), signal.SIGUSR1)
+            except OSError:
+                pass
+        notice(f"Signal sent — {label} queued.")
+
+    def daemon_start():
+        if st["running"]:
+            notice("Daemon already running.")
+            return
+        try:
+            subprocess.Popen([sys.executable, sys.argv[0], "--monitor"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            notice(f"Spawn failed: {e}")
+            return
+        time.sleep(2)
+        redetect()
+        notice(f"Daemon started (PID {st['pid']})" if st["running"] else "Daemon spawn issued")
+
+    def daemon_stop():
+        if not st["running"]:
+            notice("Daemon not running.")
+            return
+        if not st["pid"]:
+            notice("Daemon PID unknown (lockfile-only) — stop it manually.")
+            return
+        pid = int(st["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        waited = 0
+        while _pid_alive(pid) and waited < 5:
+            time.sleep(1)
+            waited += 1
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            notice("Daemon SIGKILLed (didn't exit cleanly).")
+        else:
+            notice("Daemon stopped.")
+        redetect()
+
+    def daemon_toggle():
+        if st["running"]:
+            if confirm(f"Stop the watchtower daemon (PID {st['pid'] or '?'})?"):
+                daemon_stop()
+        elif confirm("Start the watchtower daemon?"):
+            daemon_start()
+
+    def daemon_restart():
+        if not confirm("Restart the watchtower daemon?"):
+            return
+        if st["running"]:
+            daemon_stop()
+        time.sleep(1)
+        daemon_start()
+
+    def start_backup(mode):
+        if is_backup_running():
+            notice("A backup is already running.")
+            return
+        label = f"backup --mode {mode}" if mode else "backup (cfg default)"
+        if not confirm(f"Start {label}?"):
+            return
+        script = cfg("MAIN_BACKUP_SCRIPT")
+        if not os.path.isfile(script):
+            notice(f"Backup script not found: {script}")
+            return
+        extra = [f"--config={CFG_TO_LOAD}"] + (["--mode", mode] if mode else [])
+        try:
+            subprocess.Popen(_launch_argv(script, extra), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            notice(f"Started {label} in background.")
+        except OSError as e:
+            notice(f"Launch failed: {e}")
+
+    def stop_backup():
+        if not is_backup_running():
+            notice("No backup is currently running.")
+            return
+        if not confirm("Stop the running backup?"):
+            return
+        run_output(lambda: subprocess.run([sys.executable, sys.argv[0], "--stop-backup"]))
+
+    def run_restorer(args):
+        r = _hub_find_restorer()
+        if not r:
+            notice(f"Restorer not found. Set MAIN_RESTORER_SCRIPT in {CFG_TO_LOAD}.")
+            return
+        run_output(lambda: subprocess.run(_launch_argv(r, args)))
+
+    def restorer_prompt(flag, what):
+        archive = prompt(f"Archive path to {what} (empty to cancel)")
+        if archive:
+            run_restorer([flag, archive])
+
+    def logs_picker():
+        console.clear()
+        console.print("  Logs: [a]ll-auto  [w]atchtower  [b]ackupper  [r]estorer  [p]ihole/warphole  [Esc] back")
+        k = sys.stdin.read(1)  # blocking single key (we're already in cbreak)
+        if not k or k == "\x1b":
+            return
+        if k in ("a", "A"):
+            run_screen(cmd_logs)
+            return
+        target = {"w": WATCHTOWER_LOGFILE, "b": BACKUP_LOGFILE, "r": "/var/log/auto_restorer.log",
+                  "p": "/var/log/warphole.log"}.get(k.lower())
+        if not target:
+            return
+        if not os.path.isfile(target):
+            notice(f"Log not present: {target}")
+            return
+        run_output(lambda: (print(f"Tailing {target} — Ctrl+C to return.\n"),
+                            subprocess.run(["tail", "-n", "40", "-F", target])))
+
+    def render():
+        redetect()
+        console.clear()
+        if st["running"]:
+            up = _format_uptime_from_proc(st["pid"]) if st["pid"] else ""
+            dline = (f"RUNNING (PID {st['pid']}{', up ' + up if up else ''})" if st["pid"]
+                     else "RUNNING (PID unknown — lockfile)")
+        else:
+            dline = "NOT RUNNING"
+        status_now = ""
+        try:
+            status_now = open(STATUS_FILE).read().strip()
+        except OSError:
+            pass
+        hdr = Text()
+        hdr.append(f"Host: {cfg('HOSTNAME_VAR')}    Config: {CFG_TO_LOAD}\n", style="cyan")
+        hdr.append("Daemon: ")
+        hdr.append(dline + (f"   [{status_now}]" if st["running"] and status_now else "") + "\n",
+                   style="green" if st["running"] else "red")
+        hdr.append(f"Backup: {'in progress' if is_backup_running() else 'idle'}     "
+                   f"Mover: {'running' if is_mover_running() else 'idle'}     Cache: {get_cache_usage()}%\n")
+        hdr.append(f"Last:  backup {age(LAST_RUN_BACKUP)}   cleanup {age(LAST_RUN_CLEANUP)}   "
+                   f"verify {age(LAST_RUN_VERIFY)}   update {age(LAST_RUN_UPDATE)}\n", style="grey50")
+        pend = [n for n, p in (("scan", TRIGGER_SCAN), ("verify", TRIGGER_VERIFY), ("cleanup", TRIGGER_CLEANUP),
+                               ("update", TRIGGER_UPDATE), ("reload", TRIGGER_CONFIG), ("force", TRIGGER_FORCE))
+                if os.path.isfile(p)]
+        hdr.append(f"Pending: {', '.join(pend) if pend else '(none)'}", style="grey50")
+        console.print(Panel(hdr, title=f"WATCHTOWER COMMAND CENTER    {datetime.datetime.now().strftime('%H:%M:%S')}",
+                            border_style="cyan"))
+
+        toggle = "Daemon: STOP    (running)" if st["running"] else "Daemon: START   (stopped)"
+        grid = Table.grid(padding=(0, 4))
+        grid.add_column()
+        grid.add_column()
+        left = Text("WATCHTOWER ACTIONS\n", style="bold")
+        for k, lbl in (("c", "Cleanup now"), ("u", "Docker Update"), ("k", "Checksum Scan"),
+                       ("v", "Full Verify Scan"), ("R", "Reload daemon config"), ("d", toggle),
+                       ("D", "Daemon: RESTART")):
+            left.append(f"  [{k}] {lbl}\n")
+        right = Text("BACKUPPER · RESTORER · VIEWS\n", style="bold")
+        for k, lbl in (("s", "Start backup (cfg default)"), ("p", "Start --mode produce"),
+                       ("P", "Start --mode pull"), ("B", "Start --mode both"), ("x", "Stop running backup"),
+                       ("L", "List archives"), ("A", "Verify ALL archives"), ("C", "Corruption report"),
+                       ("I", "Inspect (prompts)"), ("V", "Verify single (prompts)"), ("g", "Live Graph"),
+                       ("l", "Live Logs (picker)"), ("t", "Status Snapshot"), ("q", "Quit")):
+            right.append(f"  [{k}] {lbl}\n")
+        grid.add_row(left, right)
+        console.print(grid)
+        console.print("  header refreshes every 3s · keys are case-sensitive", style="grey50")
+
+    actions = {
+        "c": lambda: signal_action("cleanup", "Cleanup"),
+        "u": lambda: signal_action("update", "Docker Update"),
+        "k": lambda: signal_action("scan", "Checksum Scan"),
+        "v": lambda: signal_action("verify", "Full Verify Scan"),
+        "R": lambda: signal_action("reload", "Config Reload"),
+        "d": daemon_toggle,
+        "D": daemon_restart,
+        "s": lambda: start_backup(""),
+        "p": lambda: start_backup("produce"),
+        "P": lambda: start_backup("pull"),
+        "B": lambda: start_backup("both"),
+        "x": stop_backup,
+        "L": lambda: run_restorer(["--list"]),
+        "A": lambda: run_restorer(["--verify-all"]),
+        "C": lambda: run_restorer(["--corruption-report"]),
+        "I": lambda: restorer_prompt("--inspect", "inspect"),
+        "V": lambda: restorer_prompt("--verify", "verify"),
+        "g": lambda: run_screen(lambda: cmd_ab_graph(st["running"], st["pid"])),
+        "l": logs_picker,
+        "t": lambda: run_output(lambda: cmd_status(st["running"], st["pid"])),
+    }
+
+    enter_raw()
+    try:
+        while True:
+            render()
+            try:
+                key = read_key(3)
+            except KeyboardInterrupt:
+                break
+            if key is None:
+                continue
+            if key in ("q", "Q"):
+                break
+            handler = actions.get(key)
+            if handler:
+                try:
+                    handler()
+                except KeyboardInterrupt:
+                    pass
+    finally:
+        leave_raw()
+        try:
+            sys.stdout.write("\033[?25h\033[2J\033[H")
+            sys.stdout.flush()
+        except Exception:
+            pass
     return 0
 
 
@@ -1851,7 +2218,7 @@ def main():
     if mode == "--ab-graph":
         sys.exit(cmd_ab_graph(daemon_running, daemon_pid))
     if mode == "--hub":
-        sys.exit(_tui_stub(mode))
+        sys.exit(cmd_hub(daemon_running, daemon_pid))
     if mode == "--monitor":
         monitor_loop()
     elif mode == "--cleanup":
