@@ -84,6 +84,7 @@ CONFIG = {
     "SHARES_BASE_FOLDER": "/mnt/user",
     "MAIN_BACKUP_SCRIPT": "/usr/local/bin/auto_backupper.sh",
     "MONITOR_INTERVAL": "300",
+    "WATCHTOWER_GRAPH_REFRESH": "1",  # --ab-graph dashboard refresh (seconds)
     "CPU_THREADS": "1",
     "LOG_VERBOSITY": "info",
     "LOG_MAX_SIZE": str(10 * 1024 * 1024),
@@ -109,6 +110,9 @@ CONFIG = {
 
     # --- Cleanup ---
     "CLEANUP_MEDIA_METADATA": "false",
+
+    # Share list (array) — used by the --ab-graph shares-progress panel.
+    "SHARES_TO_BACKUP": [],
 
     # --- Schedulers (enable + mode/value/time) ---
     "BACKUP_SCHEDULER_ENABLE": "false",
@@ -153,7 +157,7 @@ def cfg_int(key, default=0):
 
 
 # ==============================================================================
-# 3. CONFIG LOADING (bash-syntax cfg parser, scalars only)
+# 3. CONFIG LOADING (bash-syntax cfg parser: scalars + the arrays we use)
 # ==============================================================================
 
 
@@ -171,6 +175,8 @@ def parse_bash_config(filepath):
         content = open(filepath).read()
     except OSError:
         return
+    import shlex
+
     scalar = re.compile(
         r'^[ \t]*([A-Za-z_][A-Za-z0-9_]*)='
         r'''("(?:[^"\\]|\\.)*"|'[^']*'|[^\s#(]*)[ \t]*(?:#.*)?$''',
@@ -178,8 +184,17 @@ def parse_bash_config(filepath):
     )
     for m in scalar.finditer(content):
         key, raw = m.group(1), m.group(2)
-        if key in CONFIG:
+        if key in CONFIG and isinstance(CONFIG[key], str):
             CONFIG[key] = _unquote(raw)
+    # Arrays KEY=( ... ) — only for list-typed CONFIG keys (e.g. SHARES_TO_BACKUP,
+    # used by the --ab-graph shares-progress panel).
+    for m in re.finditer(r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)=\((.*?)\)", content, re.M | re.S):
+        key, body = m.group(1), m.group(2)
+        if key in CONFIG and isinstance(CONFIG[key], list):
+            try:
+                CONFIG[key] = shlex.split(body, comments=True)
+            except ValueError:
+                pass
 
 
 # ==============================================================================
@@ -1246,6 +1261,492 @@ def cmd_logs():
     return 0
 
 
+# ==============================================================================
+# --ab-graph LIVE DASHBOARD
+# ==============================================================================
+
+_ABG_SPARK = " ▁▂▃▄▅▆▇█"  # index 0..8 (0 = blank)
+
+
+def _abg_human_bytes(b):
+    b = float(b)
+    for thresh, unit in ((1099511627776, "T"), (1073741824, "G"), (1048576, "M"), (1024, "K")):
+        if b >= thresh:
+            return f"{b / thresh:.1f}{unit}"
+    return f"{int(b)}B"
+
+
+def _abg_fmt_dur(sec):
+    sec = max(0, int(sec))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _abg_sparkline(hist, maxval):
+    if maxval <= 0:
+        maxval = 1
+    out = []
+    for v in hist:
+        idx = int(round((v / maxval) * 8))
+        out.append(_ABG_SPARK[max(0, min(8, idx))])
+    return "".join(out)
+
+
+def _abg_bar(pct, width):
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round((pct / 100) * width))
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
+def _lock_held(path):
+    if not os.path.isfile(path):
+        return False
+    import fcntl
+
+    try:
+        fd = open(path, "r")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fd.close()
+
+
+def _abg_detect_worker():
+    # (kind, pid|None, logfile) for an in-progress backup/restore, else None.
+    if is_backup_running():
+        pid = None
+        try:
+            p = open(BACKUP_PIDFILE).read().strip()
+            if p.isdigit() and _pid_alive(int(p)):
+                pid = int(p)
+        except OSError:
+            pass
+        return ("backup", pid, BACKUP_LOGFILE)
+    rlock = "/var/lock/auto_restorer.lock"
+    if _lock_held(rlock):
+        pid = None
+        try:
+            p = open(rlock).read().strip()
+            if p.isdigit() and _pid_alive(int(p)):
+                pid = int(p)
+        except OSError:
+            pass
+        return ("restore", pid, "/var/log/auto_restorer.log")
+    return None
+
+
+def _abg_proc_stats(pid):
+    # (cpu_percent, rss_kb) for the worker PID via ps; (0, 0) on failure.
+    if not pid:
+        return 0.0, 0
+    try:
+        out = subprocess.run(["ps", "-o", "%cpu=,rss=", "-p", str(pid)], capture_output=True, text=True).stdout.split()
+        return float(out[0]), int(out[1])
+    except (ValueError, IndexError, OSError):
+        return 0.0, 0
+
+
+def _abg_df(path):
+    # (used_bytes, total_bytes, pct) for the filesystem holding path.
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        avail = st.f_bavail * st.f_frsize
+        used = total - st.f_bfree * st.f_frsize
+        pct = (used / total * 100) if total else 0
+        return used, total, pct, avail
+    except OSError:
+        return 0, 0, 0, 0
+
+
+def _abg_net_table():
+    # {iface: (rx_bytes, tx_bytes)} from /proc/net/dev.
+    table = {}
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, _, rest = line.partition(":")
+                name = name.strip()
+                cols = rest.split()
+                if name and len(cols) >= 9:
+                    table[name] = (int(cols[0]), int(cols[8]))
+    except (OSError, ValueError):
+        pass
+    return table
+
+
+def _abg_pick_iface():
+    # Busiest non-loopback interface by cumulative RX+TX.
+    best, best_total = "", -1
+    for name, (rx, tx) in _abg_net_table().items():
+        if name == "lo":
+            continue
+        if rx + tx > best_total:
+            best, best_total = name, rx + tx
+    return best
+
+
+def _abg_iface_speed(iface):
+    try:
+        mbps = int(open(f"/sys/class/net/{iface}/speed").read().strip())
+    except (OSError, ValueError):
+        return "unknown"
+    if mbps <= 0:
+        return "unknown"
+    if mbps >= 1000:
+        g = mbps / 1000
+        return f"{int(g)}G" if mbps % 1000 == 0 else f"{g:.1f}G"
+    return f"{mbps}M"
+
+
+def _abg_offload(iface):
+    # (tso_count, total_count, counter_name) from ethtool -S, or None.
+    if not iface or not shutil.which("ethtool"):
+        return None
+    try:
+        out = subprocess.run(["ethtool", "-S", iface], capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    stats = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            v = v.strip()
+            if v.isdigit():
+                stats[k.strip()] = int(v)
+    for num, den, name in (("tx_tso_bytes", "tx_bytes", "tx_tso_bytes"),
+                           ("tx_tcp_seg_good_bytes", "tx_bytes", "tx_tso_bytes")):
+        if num in stats and den in stats:
+            return stats[num], stats[den], name
+    for num in ("tx_tso_packets", "tso_packets", "tx_tcp_seg_good"):
+        if num in stats and "tx_packets" in stats:
+            return stats[num], stats["tx_packets"], "tx_tso_packets"
+    return None
+
+
+def _abg_tail(path, n):
+    try:
+        with open(path, errors="replace") as f:
+            return f.readlines()[-n:]
+    except OSError:
+        return []
+
+
+_ABG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) (.*)$")
+
+
+def _abg_epoch(ts):
+    from datetime import timezone
+
+    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def _abg_current_run(lines):
+    # Trim to the most recent "=== Starting" marker. Returns None when absent so
+    # callers don't surface a previous run's phases/shares.
+    start = None
+    for i, ln in enumerate(lines):
+        if "=== Starting" in ln:
+            start = i
+    return None if start is None else lines[start:]
+
+
+def _abg_phase_history(logfile, keep=8):
+    # [(text, duration_s, state, severity)] parsed from the worker log: Phase:
+    # markers after the most recent "=== Starting", with per-segment severity.
+    lines = _abg_current_run(_abg_tail(logfile, 5000))
+    if lines is None:
+        return []  # no "=== Starting" in the tail → don't show a prior run
+    phases = []  # (epoch, text, line_index)
+    for i, ln in enumerate(lines):
+        m = _ABG_TS.match(ln.rstrip("\n"))
+        if m and m.group(2).startswith("Phase:"):
+            text = m.group(2)[len("Phase:"):].strip()[:38]
+            try:
+                phases.append((_abg_epoch(m.group(1)), text, i))
+            except ValueError:
+                pass
+    if not phases:
+        return []
+    from datetime import timezone
+
+    now = datetime.datetime.now(timezone.utc).timestamp()
+    out = []
+    for idx, (epoch, text, li) in enumerate(phases):
+        end_li = phases[idx + 1][2] if idx + 1 < len(phases) else len(lines)
+        nxt = phases[idx + 1][0] if idx + 1 < len(phases) else now
+        dur = max(0, int(nxt - epoch))
+        state = "active" if idx == len(phases) - 1 else "done"
+        sev = "ok"
+        for seg in lines[li:end_li]:
+            if "FATAL" in seg or "ERROR:" in seg:
+                sev = "fail"
+                break
+            if "WARN:" in seg:
+                sev = "warn"
+        out.append((text, dur, state, sev))
+    return out[-keep:]
+
+
+def _abg_shares_progress(current_phase, logfile):
+    # [(share, state, severity)] during a shares phase, else [].
+    if not (current_phase == "Shares Backup" or current_phase.startswith("Granular Backup for")):
+        return []
+    shares = list(CONFIG.get("SHARES_TO_BACKUP") or [])
+    if not shares:
+        return []
+    lines = _abg_current_run(_abg_tail(logfile, 5000))
+    if lines is None:
+        return []
+    archived = []  # order of shares seen in Archiving: lines
+    sev = {}
+    for ln in lines:
+        if "WARN:" in ln:
+            cur = archived[-1] if archived else None
+            if cur and sev.get(cur) != "fail":
+                sev[cur] = "warn"
+        if "FATAL" in ln or "ERROR:" in ln:
+            cur = archived[-1] if archived else None
+            if cur:
+                sev[cur] = "fail"
+        m = re.search(r"/shares/([^/]+)/", ln)
+        if "Archiving:" in ln and m:
+            name = m.group(1)
+            if name not in archived:
+                archived.append(name)
+    active = archived[-1] if archived else None
+    out = []
+    for s in shares:
+        base = os.path.basename(s.rstrip("/"))
+        if base == active:
+            out.append((base, "active", sev.get(base, "ok")))
+        elif base in archived:
+            out.append((base, "done", sev.get(base, "ok")))
+        else:
+            out.append((base, "pending", "ok"))
+    return out
+
+
+def _abg_current_archive(logfile):
+    for ln in reversed(_abg_tail(logfile, 800)):
+        if "Archiving:" in ln or "Extracting " in ln:
+            m = _ABG_TS.match(ln.rstrip("\n"))
+            return m.group(2) if m else ln.strip()
+    return ""
+
+
+def _abg_recent_log(logfile, n=4):
+    out = []
+    for ln in _abg_tail(logfile, n):
+        m = _ABG_TS.match(ln.rstrip("\n"))
+        if m:
+            out.append(f"{m.group(1)[11:19]}  {m.group(2)}")
+        else:
+            out.append(ln.rstrip("\n"))
+    return out
+
+
+def cmd_ab_graph(daemon_running, daemon_pid):
+    # Live dashboard for an in-progress backup/restore. Falls through to
+    # cmd_status when nothing is running.
+    worker = _abg_detect_worker()
+    if not worker:
+        print("No backup or restore is currently running — showing status snapshot.\n")
+        return cmd_status(daemon_running, daemon_pid)
+    if not _require_rich():
+        return 1
+    from collections import deque
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.table import Table
+    from rich.console import Group
+
+    try:
+        refresh = int(cfg("WATCHTOWER_GRAPH_REFRESH"))
+        if refresh < 1:
+            raise ValueError
+    except ValueError:
+        refresh = 1
+
+    iface = _abg_pick_iface()
+    link = _abg_iface_speed(iface) if iface else "unknown"
+    base = cfg("WATCH_DIR")
+    win = 60
+    cpu_h = deque(maxlen=win)
+    mem_h = deque(maxlen=win)
+    wr_h = deque(maxlen=win)
+    rx_h = deque(maxlen=win)
+    tx_h = deque(maxlen=win)
+    prev = {"avail": None, "rx": None, "tx": None, "tso": None, "tot": None}
+    spin = ["─", "\\", "|", "/"]
+
+    interactive = sys.stdin.isatty()
+    old_term = None
+    if interactive:
+        try:
+            import termios
+            import tty
+
+            old_term = termios.tcgetattr(sys.stdin.fileno())
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            interactive = False
+
+    def read_key(timeout):
+        if not interactive:
+            time.sleep(timeout)
+            return None
+        import select
+
+        dr, _, _ = select.select([sys.stdin], [], [], timeout)
+        return sys.stdin.read(1) if dr else None
+
+    def sev_marker(state, severity, frame):
+        if state == "active":
+            return f"[{spin[frame % 4]}]"
+        if state == "pending":
+            return "[ ]"
+        return {"ok": "[✓]", "warn": "[!]", "fail": "[x]"}.get(severity, "[✓]")
+
+    def render(frame):
+        kind, pid, logfile = worker
+        cpu, rss = _abg_proc_stats(pid)
+        used, total, pct, avail = _abg_df(base)
+
+        # disk-write rate from available-bytes delta
+        if prev["avail"] is not None:
+            wr_h.append(max(0, (prev["avail"] - avail) / refresh))
+        prev["avail"] = avail
+        cpu_h.append(cpu)
+        mem_h.append(rss)
+
+        net = _abg_net_table().get(iface, (0, 0)) if iface else (0, 0)
+        if prev["rx"] is not None:
+            rx_h.append(max(0, (net[0] - prev["rx"]) / refresh))
+            tx_h.append(max(0, (net[1] - prev["tx"]) / refresh))
+        prev["rx"], prev["tx"] = net
+
+        phases = _abg_phase_history(logfile)
+        current_phase = phases[-1][0] if phases else ""
+
+        header = Panel(
+            Text(f"AB-GRAPH   worker={kind}  PID={pid or 'unknown'}  refresh={refresh}s   "
+                 f"{datetime.datetime.now().strftime('%H:%M:%S')}\n"
+                 f"Up: {_format_uptime_from_proc(pid) or 'unknown'}   Host: {cfg('HOSTNAME_VAR')}   "
+                 f"Config: {CFG_TO_LOAD}", style="bold cyan"),
+            border_style="cyan",
+        )
+
+        ph = Text()
+        if phases:
+            for text, dur, state, sev in phases[-6:]:
+                style = {"ok": "green", "warn": "yellow", "fail": "red"}.get(sev, "white")
+                ph.append(f"  {sev_marker(state, sev, frame)} ", style=style)
+                ph.append(f"{text:<40} {_abg_fmt_dur(dur):>9}  {state}\n")
+        else:
+            ph.append("  (no Phase: markers yet — worker may be in pre-flight)\n", style="grey50")
+        groups = [header, Panel(ph, title="PHASES (current run)", border_style="grey50")]
+
+        shares = _abg_shares_progress(current_phase, logfile)
+        if shares:
+            done = sum(1 for _, st, _ in shares if st == "done")
+            st_txt = Text()
+            shown = 0
+            pending_extra = 0
+            for name, state, sev in shares:
+                if state == "pending" and shown >= 10:
+                    pending_extra += 1
+                    continue
+                style = {"ok": "green", "warn": "yellow", "fail": "red"}.get(sev, "white")
+                st_txt.append(f"  {sev_marker(state, sev, frame)} ", style=style)
+                st_txt.append(f"{name}\n")
+                shown += 1
+            if pending_extra:
+                st_txt.append(f"  ... and {pending_extra} more pending\n", style="grey50")
+            groups.append(Panel(st_txt, title=f"SHARES ({done}/{len(shares)} done)", border_style="grey50"))
+
+        cur = _abg_current_archive(logfile)
+        proc = Text()
+        proc.append("  CPU    ", style="cyan")
+        proc.append(f"{_abg_sparkline(cpu_h, 100):<60} {cpu:.0f}%\n")
+        proc.append("  MEM    ", style="cyan")
+        proc.append(f"{_abg_sparkline(mem_h, max(mem_h) if mem_h else 1):<60} {_abg_human_bytes(rss * 1024)}\n")
+        proc.append("  WRITE  ", style="cyan")
+        proc.append(f"{_abg_sparkline(wr_h, max(wr_h) if wr_h else 1):<60} {_abg_human_bytes(wr_h[-1] if wr_h else 0)}/s\n")
+        if cur:
+            proc.append(f"  CURRENT: {cur[:70]}\n", style="grey50")
+        groups.append(Panel(proc, title="PROCESS", border_style="grey50"))
+
+        net_txt = Text()
+        if iface:
+            net_txt.append("  RX     ", style="cyan")
+            net_txt.append(f"{_abg_sparkline(rx_h, max(rx_h) if rx_h else 1):<60} {_abg_human_bytes(rx_h[-1] if rx_h else 0)}/s\n")
+            net_txt.append("  TX     ", style="cyan")
+            net_txt.append(f"{_abg_sparkline(tx_h, max(tx_h) if tx_h else 1):<60} {_abg_human_bytes(tx_h[-1] if tx_h else 0)}/s\n")
+            off = _abg_offload(iface)
+            if off:
+                tso, tot, name = off
+                if prev["tso"] is None:
+                    label = f"warming up ({name})"
+                else:
+                    d_tso, d_tot = tso - prev["tso"], tot - prev["tot"]
+                    label = (f"{max(0, min(100, d_tso / d_tot * 100)):.0f}% ({name})" if d_tot > 0 else f"idle ({name})")
+                prev["tso"], prev["tot"] = tso, tot
+                net_txt.append(f"  Offload (TX): {label}\n", style="grey50")
+            title = f"NETWORK ({iface}, link {link})"
+        else:
+            net_txt.append("  (no usable interface detected)\n", style="grey50")
+            title = "NETWORK"
+        groups.append(Panel(net_txt, title=title, border_style="grey50"))
+
+        bar = _abg_bar(pct, 40)
+        dest = Text(f"  {bar}  {pct:.0f}%  ({_abg_human_bytes(used)} / {_abg_human_bytes(total)})")
+        groups.append(Panel(dest, title=f"DEST: {base}", border_style="grey50"))
+
+        rec = Text("\n".join(_abg_recent_log(logfile, 4)) or "  (no recent log)")
+        groups.append(Panel(rec, title="RECENT LOG", border_style="grey50"))
+        groups.append(Text(" [q] quit", style="cyan"))
+        return Group(*groups)
+
+    frame = 0
+    try:
+        with Live(auto_refresh=False, screen=True) as live:
+            while True:
+                if not _abg_detect_worker():
+                    break  # worker finished
+                try:
+                    live.update(render(frame), refresh=True)
+                except Exception:
+                    pass
+                frame += 1
+                key = read_key(refresh)
+                if key in ("q", "Q"):
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        if old_term is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+    return 0
+
+
 def _tui_stub(mode):
     print(f"{mode}: the interactive dashboard is not yet ported to Python.")
     print("Use the bash watchtower for it:  ./watchtower.sh " + mode)
@@ -1347,7 +1848,9 @@ def main():
         sys.exit(cmd_status(daemon_running, daemon_pid))
     if mode == "--logs":
         sys.exit(cmd_logs())
-    if mode in ("--ab-graph", "--hub"):
+    if mode == "--ab-graph":
+        sys.exit(cmd_ab_graph(daemon_running, daemon_pid))
+    if mode == "--hub":
         sys.exit(_tui_stub(mode))
     if mode == "--monitor":
         monitor_loop()
