@@ -19,6 +19,11 @@
 #   ./watchtower.sh --scan --verify          # Verify ALL files (or signal daemon)
 #   ./watchtower.sh --cleanup                # One-Time Junk Cleanup (or signal daemon)
 #   ./watchtower.sh --update                 # Update Docker Containers (or signal daemon)
+#   ./watchtower.sh --recover                # Repair ghost Docker containers (or signal daemon)
+#   ./watchtower.sh --recover --dry-run      # Show what recovery WOULD do; change nothing
+#                                            #   (--dry-run / --no-recreate apply to a
+#                                            #   standalone run only; a running daemon
+#                                            #   uses its DOCKER_RECOVERY_* config)
 #   ./watchtower.sh --force                  # Wake up daemon immediately
 #   ./watchtower.sh --start-backup           # Force Start Backup
 #   ./watchtower.sh --stop-backup            # Force Stop Backup
@@ -64,6 +69,7 @@ TRIGGER_VERIFY="/tmp/ab_watchtower_trigger_verify"
 TRIGGER_CONFIG="/tmp/ab_watchtower_trigger_config"
 TRIGGER_CLEANUP="/tmp/ab_watchtower_trigger_cleanup"
 TRIGGER_FORCE="/tmp/ab_watchtower_trigger_force"
+TRIGGER_RECOVERY="/tmp/ab_watchtower_trigger_recovery"
 STATUS_FILE="/tmp/ab_watchtower.status"
 
 # State Tracking (Prevents Log Flooding)
@@ -83,6 +89,19 @@ LOG_VERBOSITY="info"
 # Defaults for Updater
 UPDATE_SCHEDULER_ENABLE=false
 DOCKER_UPDATE_EXCLUDE="mariadb"
+
+# Defaults for Docker Container Recovery (Unraid ghost-container repair)
+DOCKER_RECOVERY_ENABLE=false
+DOCKER_RECOVERY_RUN_ON_STARTUP=true
+DOCKER_RECOVERY_INTERVAL=3600
+DOCKER_RECOVERY_NO_RECREATE=false
+DOCKER_RECOVERY_DRYRUN=false
+# Docker states treated as a broken "ghost" to recover. A non-running container
+# in ANY other state (notably a clean "exited") is treated as intentionally
+# stopped and left untouched — recovery never starts a container you stopped.
+DOCKER_RECOVERY_GHOST_STATES="created dead restarting"
+DOCKER_TEMPLATE_DIR="/boot/config/plugins/dockerMan/templates-user"
+DOCKER_RECOVERY_DIR="/boot/config/ab_recovery"
 
 # Defaults for Cache Monitor (prevents `set -u` crashes when config is missing)
 ENABLE_CACHE_MONITOR=false
@@ -134,6 +153,10 @@ LAST_RUN_BACKUP="/tmp/auto_backupper_last_run_backup"
 LAST_RUN_CLEANUP="/tmp/auto_backupper_last_run_cleanup"
 LAST_RUN_VERIFY="/tmp/auto_backupper_last_run_verify"
 LAST_RUN_UPDATE="/tmp/auto_backupper_last_run_update"
+LAST_RUN_RECOVERY="/tmp/auto_backupper_last_run_recovery"
+# Sub-day interval gate for periodic recovery passes (epoch seconds; the
+# YYYYMMDD LAST_RUN_RECOVERY above is only for the --status age display).
+RECOVERY_LAST_PASS_EPOCH="/tmp/ab_watchtower_recovery_epoch"
 
 # ==============================================================================
 # 2. CORE TOOLS
@@ -290,7 +313,7 @@ smart_sleep() {
 
 	# Loop in 3-second bursts until duration is met
 	while [[ $(date +%s) -lt $wake_time ]]; do
-		if [[ -f "$TRIGGER_SCAN" || -f "$TRIGGER_UPDATE" || -f "$TRIGGER_VERIFY" || -f "$TRIGGER_CONFIG" || -f "$TRIGGER_CLEANUP" || -f "$TRIGGER_FORCE" ]]; then
+		if [[ -f "$TRIGGER_SCAN" || -f "$TRIGGER_UPDATE" || -f "$TRIGGER_VERIFY" || -f "$TRIGGER_CONFIG" || -f "$TRIGGER_CLEANUP" || -f "$TRIGGER_FORCE" || -f "$TRIGGER_RECOVERY" ]]; then
 			# Trigger detected! Exit sleep immediately.
 			# The main loop will catch the trigger at the top of the next cycle.
 			return 0
@@ -722,6 +745,338 @@ check_update_scheduler() {
 }
 
 # ==============================================================================
+# 5b. DOCKER CONTAINER RECOVERY
+# ==============================================================================
+# Hands-off repair for Unraid Docker containers that come back broken after a
+# reboot — the "RWLayer is unexpectedly nil" / "name already in use" case, where
+# a container's config survives but its writable layer is gone, so it can't be
+# started, only removed and recreated. Folded in from the standalone
+# ghost-recovery tool so the daemon catches ghosts on startup (post-reboot) and
+# on an interval, reusing the suite's logging, notifications and status.
+#
+# Each pass: for every container backed by an Unraid user template, healthy
+# (running) ones get their "recovery recipe" (the exact docker run, reconstructed
+# from `docker inspect`) refreshed on flash. A container that is merely STOPPED
+# (state "exited"/"paused"/etc.) is treated as intentionally down and left
+# exactly as-is — recovery NEVER starts a container you stopped on purpose. Only
+# containers in an abnormal/ghost state (DOCKER_RECOVERY_GHOST_STATES, default
+# created/dead/restarting) are recovered: `docker start` is tried first and, if
+# that fails and recreate is allowed, the container is removed and recreated from
+# the recipe with its Unraid GUI labels preserved so it stays managed.
+#
+# DATA SAFETY: app data lives in the bind-mounted appdata paths, not in the
+# container. Removing/recreating a container does not touch those paths. This
+# code never deletes a volume, an appdata path, or an image, and never changes
+# the run-state of a container that is simply stopped.
+#
+# Unraid-targeted: discovery keys off the user-template dir, so on non-Unraid
+# hosts (no templates) every pass is a no-op.
+
+# Per-pass state. Globals (reset at the top of run_docker_recovery_task) so the
+# helpers below can share the reconstructed args + counters without threading
+# them through every call. Declared here to stay set -u safe.
+declare -A _REC_TEMPLATE_OF=()
+declare -A _REC_STATE_OF=()
+declare -a _REC_RUN_ARGS=()
+declare -i _REC_N_OK=0 _REC_N_GHOST=0 _REC_N_SKIPPED=0 _REC_N_START=0 _REC_N_RECREATE=0 _REC_N_MANUAL=0 _REC_N_ERROR=0
+
+# Reconstruct a container's `docker run` invocation from its (surviving) config
+# into _REC_RUN_ARGS. Returns 1 if the container can't be inspected (the caller
+# then falls back to a saved recipe).
+_recovery_build_run_args() {
+	local name="$1" id image netmode priv hostname restart maxretry shm cpuset mem line
+	_REC_RUN_ARGS=()
+
+	id=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null) || return 1
+	[[ -z "$id" ]] && return 1
+
+	# The image is the one field whose absence yields a broken recipe (an empty
+	# positional arg -> `docker run ... ''`). Guard it so a container that vanishes
+	# between this call and the .Id call above makes the whole build fail — the
+	# caller then falls back to the saved recipe instead of recreating from, or
+	# persisting, a corrupt one. The remaining fields being empty is benign: it
+	# just omits an optional flag, which is correct for an unset value.
+	image=$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null) || return 1
+	[[ -z "$image" ]] && return 1
+	netmode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name")
+	priv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$name")
+	hostname=$(docker inspect -f '{{.Config.Hostname}}' "$name")
+	restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name")
+	maxretry=$(docker inspect -f '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$name")
+	shm=$(docker inspect -f '{{.HostConfig.ShmSize}}' "$name")
+	cpuset=$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$name")
+	mem=$(docker inspect -f '{{.HostConfig.Memory}}' "$name")
+
+	_REC_RUN_ARGS+=(run -d --name "$name")
+	[[ -n "$netmode" && "$netmode" != "default" ]] && _REC_RUN_ARGS+=(--network "$netmode")
+	[[ "$priv" == "true" ]] && _REC_RUN_ARGS+=(--privileged)
+
+	if [[ -n "$restart" && "$restart" != "no" ]]; then
+		if [[ "$restart" == "on-failure" && "${maxretry:-0}" -gt 0 ]]; then
+			_REC_RUN_ARGS+=(--restart "on-failure:${maxretry}")
+		else
+			_REC_RUN_ARGS+=(--restart "$restart")
+		fi
+	fi
+
+	# Skip a stale auto-generated hostname (the short container id).
+	[[ -n "$hostname" && "$hostname" != "${id:0:12}" ]] && _REC_RUN_ARGS+=(--hostname "$hostname")
+	[[ -n "$shm" && "$shm" != "67108864" && "$shm" != "0" ]] && _REC_RUN_ARGS+=(--shm-size "$shm")
+	[[ -n "$cpuset" ]] && _REC_RUN_ARGS+=(--cpuset-cpus "$cpuset")
+	[[ -n "$mem" && "$mem" != "0" ]] && _REC_RUN_ARGS+=(--memory "$mem")
+
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(-v "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.Binds}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(-e "$line"); done \
+		< <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--label "$line"); done \
+		< <(docker inspect -f '{{range $k,$v := .Config.Labels}}{{printf "%s=%s\n" $k $v}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--device "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.Devices}}{{printf "%s:%s:%s\n" .PathOnHost .PathInContainer .CgroupPermissions}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--cap-add "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.CapAdd}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--cap-drop "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.CapDrop}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--add-host "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' "$name")
+
+	# Port publishes (not valid with host networking).
+	if [[ "$netmode" != "host" ]]; then
+		local hip hport cport
+		while IFS='|' read -r hip hport cport; do
+			[[ -z "$cport" ]] && continue
+			if [[ -n "$hip" ]]; then _REC_RUN_ARGS+=(-p "${hip}:${hport}:${cport}")
+			else _REC_RUN_ARGS+=(-p "${hport}:${cport}"); fi
+		done < <(docker inspect -f '{{range $p,$arr := .HostConfig.PortBindings}}{{range $arr}}{{printf "%s|%s|%s\n" .HostIp .HostPort $p}}{{end}}{{end}}' "$name")
+	fi
+
+	# Static IP on a custom network (br0, etc.).
+	case "$netmode" in
+		bridge|host|none|default|container:*) : ;;
+		*)
+			local ip
+			ip=$(docker inspect -f "{{with (index .NetworkSettings.Networks \"$netmode\")}}{{if .IPAMConfig}}{{.IPAMConfig.IPv4Address}}{{end}}{{end}}" "$name" 2>/dev/null)
+			[[ -n "$ip" ]] && _REC_RUN_ARGS+=(--ip "$ip")
+			;;
+	esac
+
+	_REC_RUN_ARGS+=("$image")   # image is positional: after options, before cmd
+	while IFS= read -r line; do _REC_RUN_ARGS+=("$line"); done \
+		< <(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "$name")
+
+	return 0
+}
+
+# Persist / load the recovery recipe, null-delimited so no eval is needed on
+# replay. _recovery_save_args only writes when the recipe changed (flash-friendly).
+_recovery_save_args() {
+	local name="$1" file="$DOCKER_RECOVERY_DIR/${name}.args" tmp
+	tmp=$(mktemp) || return 0
+	printf '%s\0' "${_REC_RUN_ARGS[@]}" >"$tmp"
+	if [[ -f "$file" ]] && cmp -s "$tmp" "$file"; then rm -f "$tmp"; else mv -f "$tmp" "$file"; fi
+}
+_recovery_load_args() {
+	local name="$1" file="$DOCKER_RECOVERY_DIR/${name}.args"
+	[[ -f "$file" ]] || return 1
+	_REC_RUN_ARGS=()
+	mapfile -d '' _REC_RUN_ARGS <"$file"
+	((${#_REC_RUN_ARGS[@]} > 0))
+}
+_recovery_printable_cmd() {   # human-readable, copy-pasteable
+	local out="docker" a
+	for a in "${_REC_RUN_ARGS[@]}"; do out+=" $(printf '%q' "$a")"; done
+	printf '%s' "$out"
+}
+
+# Recover one broken ("ghost") container. Increments the _REC_N_* counters.
+_recovery_one() {
+	local name="$1" st newid
+	if docker start "$name" >/dev/null 2>&1; then
+		sleep 2
+		st=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)
+		if [[ "$st" == "running" ]]; then
+			log "RECOVERY: recovered (start): $name is running again."
+			_REC_N_START+=1
+			return 0
+		fi
+		log "WARN: RECOVERY — $name started but is now '$st' (possible crash loop); check: docker logs $name"
+		_REC_N_START+=1
+		return 0
+	fi
+
+	if [[ "${DOCKER_RECOVERY_NO_RECREATE:-false}" == "true" ]]; then
+		log "WARN: RECOVERY — $name will not start and DOCKER_RECOVERY_NO_RECREATE=true. Remove it and re-apply its template."
+		_REC_N_MANUAL+=1
+		return 1
+	fi
+
+	log "RECOVERY: plain start failed for $name (nil RWLayer / corrupt layer); recreating from config."
+
+	if ! _recovery_build_run_args "$name"; then
+		if _recovery_load_args "$name"; then
+			log "RECOVERY: $name not inspectable; using saved recovery recipe."
+		else
+			log "WARN: RECOVERY — cannot inspect $name and no saved recipe exists. Re-add it from its template."
+			_REC_N_MANUAL+=1
+			return 1
+		fi
+	fi
+
+	log "RECOVERY: plan: $(_recovery_printable_cmd)"
+	if [[ "${DOCKER_RECOVERY_DRYRUN:-false}" == "true" ]]; then
+		log "RECOVERY: dry-run — not removing/recreating $name."
+		return 0
+	fi
+
+	if ! docker rm "$name" >/dev/null 2>&1; then docker rm -f "$name" >/dev/null 2>&1; fi
+	if docker inspect "$name" >/dev/null 2>&1; then
+		log "ERROR: RECOVERY — could not remove $name; skipping. Try manually: docker rm -f $name"
+		_REC_N_ERROR+=1
+		return 1
+	fi
+
+	if newid=$(docker "${_REC_RUN_ARGS[@]}" 2>&1); then
+		log "RECOVERY: recovered (recreate): $name -> ${newid:0:12}"
+		_REC_N_RECREATE+=1
+		return 0
+	else
+		log "ERROR: RECOVERY — recreate failed for $name: $newid"
+		_REC_N_ERROR+=1
+		return 1
+	fi
+}
+
+# Is this docker state one we treat as a broken "ghost" to recover? A non-running
+# container in any other state (notably a clean "exited") is treated as
+# intentionally stopped and left untouched. Config-tunable for environments
+# where ghosts present differently.
+_recovery_state_is_ghost() {
+	local state="$1" g
+	# Unquoted on purpose: split the space-separated state list into words.
+	for g in ${DOCKER_RECOVERY_GHOST_STATES:-created dead restarting}; do
+		[[ "$state" == "$g" ]] && return 0
+	done
+	return 1
+}
+
+# Full recovery pass: refresh recipes for healthy containers, recover ghosts.
+# Like run_docker_update_task this runs unconditionally when called — the
+# ENABLE gate lives in the callers (startup pass + check_recovery_interval),
+# so a standalone `--recover` works regardless of DOCKER_RECOVERY_ENABLE.
+# Returns 1 if anything still needs a human (manual action or error).
+run_docker_recovery_task() {
+	set_status "Recovering Containers"
+	local mode="recover"
+	[[ "${DOCKER_RECOVERY_DRYRUN:-false}" == "true" ]] && mode="dry-run"
+	[[ "${DOCKER_RECOVERY_NO_RECREATE:-false}" == "true" ]] && mode="${mode}+no-recreate"
+	log "RECOVERY: ===== Container recovery start (mode: $mode) ====="
+
+	if ! command -v docker >/dev/null 2>&1; then
+		log "RECOVERY: docker not available — skipping."
+		set_status "Idle"
+		return 0
+	fi
+	if ! docker info >/dev/null 2>&1; then
+		log "WARN: RECOVERY — cannot reach the Docker daemon; skipping this pass."
+		set_status "Idle"
+		return 0
+	fi
+
+	mkdir -p "$DOCKER_RECOVERY_DIR" 2>/dev/null
+
+	# Reset per-pass state.
+	_REC_TEMPLATE_OF=()
+	_REC_STATE_OF=()
+	_REC_RUN_ARGS=()
+	_REC_N_OK=0; _REC_N_GHOST=0; _REC_N_SKIPPED=0; _REC_N_START=0; _REC_N_RECREATE=0; _REC_N_MANUAL=0; _REC_N_ERROR=0
+
+	# Map Unraid user template name -> template file.
+	local tdir="${DOCKER_TEMPLATE_DIR:-/boot/config/plugins/dockerMan/templates-user}"
+	if [[ ! -d "$tdir" ]]; then
+		log "RECOVERY: template dir not found ($tdir) — nothing to manage (non-Unraid host?)."
+		set_status "Idle"
+		return 0
+	fi
+	local f tname
+	while IFS= read -r -d '' f; do
+		tname=$(sed -n 's:.*<Name>\(.*\)</Name>.*:\1:p' "$f" | head -n1)
+		[[ -n "$tname" ]] && _REC_TEMPLATE_OF["$tname"]="$f"
+	done < <(find "$tdir" -maxdepth 1 -name '*.xml' -print0 2>/dev/null)
+
+	if ((${#_REC_TEMPLATE_OF[@]} == 0)); then
+		log "RECOVERY: no user templates found under $tdir; nothing to manage."
+		set_status "Idle"
+		return 0
+	fi
+
+	# Snapshot every container the daemon knows: name -> state.
+	local cname cstate
+	while IFS=$'\t' read -r cname cstate; do
+		[[ -n "$cname" ]] && _REC_STATE_OF["$cname"]="$cstate"
+	done < <(docker ps -a --format '{{.Names}}\t{{.State}}')
+
+	local name state
+	local TNAMES=()
+	mapfile -t TNAMES < <(printf '%s\n' "${!_REC_TEMPLATE_OF[@]}" | sort)
+	for name in "${TNAMES[@]}"; do
+		state="${_REC_STATE_OF[$name]:-__none__}"
+		if [[ "$state" == "running" ]]; then
+			_REC_N_OK+=1
+			# Keep the recipe fresh while the container is healthy.
+			_recovery_build_run_args "$name" && _recovery_save_args "$name"
+		elif [[ "$state" == "__none__" ]]; then
+			:   # template exists, no container — normal; nothing to do
+		elif _recovery_state_is_ghost "$state"; then
+			_REC_N_GHOST+=1
+			log "RECOVERY: ghost: $name (state=$state) — attempting recovery."
+			_recovery_one "$name"
+		else
+			# Merely stopped (exited/paused/…). Treat as intentionally down and
+			# leave it EXACTLY as-is — never start a container the user stopped.
+			_REC_N_SKIPPED+=1
+			log "RECOVERY: leaving $name as-is (state=$state) — intentionally stopped, not a ghost state."
+		fi
+	done
+
+	log "RECOVERY: summary: ${_REC_N_OK} healthy, ${_REC_N_GHOST} ghost(s), ${_REC_N_SKIPPED} left stopped | recovered ${_REC_N_START} via start, ${_REC_N_RECREATE} via recreate | ${_REC_N_MANUAL} need manual action, ${_REC_N_ERROR} error(s)."
+	log "RECOVERY: ===== Container recovery end ====="
+
+	if ((_REC_N_START > 0 || _REC_N_RECREATE > 0)); then
+		send_notify "normal" "Container Recovery" "Recovered ${_REC_N_START} via start, ${_REC_N_RECREATE} via recreate."
+	fi
+	if ((_REC_N_MANUAL > 0 || _REC_N_ERROR > 0)); then
+		send_notify "alert" "Container Recovery" "${_REC_N_MANUAL} need manual action, ${_REC_N_ERROR} error(s). See $LOGFILE."
+	fi
+
+	atomic_write "$LAST_RUN_RECOVERY" "$(date +%Y%m%d)"
+	set_status "Idle"
+	((_REC_N_MANUAL + _REC_N_ERROR > 0)) && return 1
+	return 0
+}
+
+# Interval gate for the monitor loop: run a recovery pass at most once per
+# DOCKER_RECOVERY_INTERVAL seconds (0 = startup-only). Backgrounded (&) so it
+# never blocks the daemon's poll cycle, mirroring the updater/cleanup schedulers.
+check_recovery_interval() {
+	[[ "${DOCKER_RECOVERY_ENABLE:-false}" != "true" ]] && return
+	is_backup_running && return
+	local interval="${DOCKER_RECOVERY_INTERVAL:-3600}"
+	[[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+	((interval == 0)) && return
+	local now last=0
+	now=$(date +%s)
+	if [[ -f "$RECOVERY_LAST_PASS_EPOCH" ]]; then
+		last=$(cat "$RECOVERY_LAST_PASS_EPOCH" 2>/dev/null || echo 0)
+		[[ "$last" =~ ^[0-9]+$ ]] || last=0
+	fi
+	if ((now - last >= interval)); then
+		# Mark the epoch up front (before the &) so a long pass can't re-fire.
+		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$now"
+		run_docker_recovery_task &
+	fi
+}
+
+# ==============================================================================
 # 6. SCHEDULER UTILS
 # ==============================================================================
 
@@ -889,6 +1244,14 @@ check_manual_triggers() {
 	if [[ -f "$TRIGGER_FORCE" ]]; then
 		log "MANUAL: Force Trigger received. Starting immediate cycle..."
 		rm -f "$TRIGGER_FORCE"
+	fi
+
+	# --- 7. Container Recovery ---
+	if [[ -f "$TRIGGER_RECOVERY" ]]; then
+		log "MANUAL: Trigger received for Container Recovery."
+		rm -f "$TRIGGER_RECOVERY"
+		run_docker_recovery_task
+		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$(date +%s)"
 	fi
 }
 
@@ -1172,15 +1535,17 @@ cmd_status() {
 
 	echo ""
 	echo "Schedule history:"
-	local b c v u
-	b=$(cat "$LAST_RUN_BACKUP"  2>/dev/null || true)
-	c=$(cat "$LAST_RUN_CLEANUP" 2>/dev/null || true)
-	v=$(cat "$LAST_RUN_VERIFY"  2>/dev/null || true)
-	u=$(cat "$LAST_RUN_UPDATE"  2>/dev/null || true)
-	printf "  %-22s %s\n" "Last backup:"  "$(_format_age_days "$b")"
-	printf "  %-22s %s\n" "Last cleanup:" "$(_format_age_days "$c")"
-	printf "  %-22s %s\n" "Last verify:"  "$(_format_age_days "$v")"
-	printf "  %-22s %s\n" "Last update:"  "$(_format_age_days "$u")"
+	local b c v u r
+	b=$(cat "$LAST_RUN_BACKUP"   2>/dev/null || true)
+	c=$(cat "$LAST_RUN_CLEANUP"  2>/dev/null || true)
+	v=$(cat "$LAST_RUN_VERIFY"   2>/dev/null || true)
+	u=$(cat "$LAST_RUN_UPDATE"   2>/dev/null || true)
+	r=$(cat "$LAST_RUN_RECOVERY" 2>/dev/null || true)
+	printf "  %-22s %s\n" "Last backup:"   "$(_format_age_days "$b")"
+	printf "  %-22s %s\n" "Last cleanup:"  "$(_format_age_days "$c")"
+	printf "  %-22s %s\n" "Last verify:"   "$(_format_age_days "$v")"
+	printf "  %-22s %s\n" "Last update:"   "$(_format_age_days "$u")"
+	printf "  %-22s %s\n" "Last recovery:" "$(_format_age_days "$r")"
 
 	echo ""
 	echo "Live processes:"
@@ -1199,7 +1564,7 @@ cmd_status() {
 	echo ""
 	echo "Pending IPC triggers:"
 	local t
-	for t in scan verify cleanup update config force; do
+	for t in scan verify cleanup update config force recovery; do
 		local var="TRIGGER_${t^^}"
 		local path="${!var:-}"
 		if [[ -n "$path" && -f "$path" ]]; then
@@ -2396,11 +2761,12 @@ _hub_signal_action() {
 	local action="$1" label="$2"
 	local trigger_file=""
 	case "$action" in
-		update)  trigger_file="$TRIGGER_UPDATE" ;;
-		scan)    trigger_file="$TRIGGER_SCAN" ;;
-		verify)  trigger_file="$TRIGGER_VERIFY" ;;
-		cleanup) trigger_file="$TRIGGER_CLEANUP" ;;
-		reload)  trigger_file="$TRIGGER_CONFIG" ;;
+		update)   trigger_file="$TRIGGER_UPDATE" ;;
+		scan)     trigger_file="$TRIGGER_SCAN" ;;
+		verify)   trigger_file="$TRIGGER_VERIFY" ;;
+		cleanup)  trigger_file="$TRIGGER_CLEANUP" ;;
+		recovery) trigger_file="$TRIGGER_RECOVERY" ;;
+		reload)   trigger_file="$TRIGGER_CONFIG" ;;
 		*) _hub_notice "Unknown action: $action"; return ;;
 	esac
 	if ! _hub_confirm "Trigger ${label}?"; then return; fi
@@ -2587,20 +2953,22 @@ _hub_render_header() {
 	cache_pct=$(get_cache_usage 2>/dev/null || echo "n/a")
 
 	# Schedule history (same data as cmd_status).
-	local b c v u
-	b=$(cat "$LAST_RUN_BACKUP"  2>/dev/null || true)
-	c=$(cat "$LAST_RUN_CLEANUP" 2>/dev/null || true)
-	v=$(cat "$LAST_RUN_VERIFY"  2>/dev/null || true)
-	u=$(cat "$LAST_RUN_UPDATE"  2>/dev/null || true)
+	local b c v u r
+	b=$(cat "$LAST_RUN_BACKUP"   2>/dev/null || true)
+	c=$(cat "$LAST_RUN_CLEANUP"  2>/dev/null || true)
+	v=$(cat "$LAST_RUN_VERIFY"   2>/dev/null || true)
+	u=$(cat "$LAST_RUN_UPDATE"   2>/dev/null || true)
+	r=$(cat "$LAST_RUN_RECOVERY" 2>/dev/null || true)
 
 	# Pending triggers — readable list of any queued action files.
 	local pending=()
 	[[ -f "$TRIGGER_UPDATE"  ]] && pending+=("update")
 	[[ -f "$TRIGGER_SCAN"    ]] && pending+=("scan")
 	[[ -f "$TRIGGER_VERIFY"  ]] && pending+=("verify")
-	[[ -f "$TRIGGER_CLEANUP" ]] && pending+=("cleanup")
-	[[ -f "$TRIGGER_CONFIG"  ]] && pending+=("reload")
-	[[ -f "$TRIGGER_FORCE"   ]] && pending+=("force")
+	[[ -f "$TRIGGER_CLEANUP"  ]] && pending+=("cleanup")
+	[[ -f "$TRIGGER_RECOVERY" ]] && pending+=("recovery")
+	[[ -f "$TRIGGER_CONFIG"   ]] && pending+=("reload")
+	[[ -f "$TRIGGER_FORCE"    ]] && pending+=("force")
 	local pending_str="(none)"
 	((${#pending[@]} > 0)) && pending_str="${pending[*]}"
 
@@ -2608,9 +2976,9 @@ _hub_render_header() {
 	printf "  Host: %s   Config: %s\n" "$HOSTNAME_VAR" "$CFG_TO_LOAD"
 	printf "  Daemon: %s\n" "$daemon_line"
 	printf "  Backup: %-12s Mover: %-10s Cache: %s%%\n" "$backup_state" "$mover_state" "$cache_pct"
-	printf "  Last:   backup %-15s cleanup %-15s verify %-15s update %s\n" \
+	printf "  Last:   backup %-15s cleanup %-15s verify %-15s update %-15s recovery %s\n" \
 		"$(_format_age_days "$b")" "$(_format_age_days "$c")" \
-		"$(_format_age_days "$v")" "$(_format_age_days "$u")"
+		"$(_format_age_days "$v")" "$(_format_age_days "$u")" "$(_format_age_days "$r")"
 	printf "  Pending: %s\n" "$pending_str"
 }
 
@@ -2630,6 +2998,7 @@ _hub_render_menu() {
 	echo "    [u]  Docker Update                  [l]  Live Logs (picker)"
 	echo "    [k]  Checksum Scan                  [t]  Status Snapshot"
 	echo "    [v]  Full Verify Scan"
+	echo "    [G]  Container Recovery"
 	echo "    [R]  Reload daemon config"
 	echo "    [d]  ${toggle_label}"
 	echo "    [D]  Daemon: RESTART"
@@ -2681,6 +3050,7 @@ cmd_hub() {
 				u) _hub_signal_action update  "Docker Update" ;;
 				k) _hub_signal_action scan    "Checksum Scan" ;;
 				v) _hub_signal_action verify  "Full Verify Scan" ;;
+				G) _hub_signal_action recovery "Container Recovery" ;;
 				R) _hub_signal_action reload  "Config Reload" ;;
 				# --- Watchtower daemon lifecycle ---
 				d) _hub_toggle_daemon ;;
@@ -2725,6 +3095,7 @@ for arg in "$@"; do
 	--scan) MODE="--scan" ;;
 	--cleanup) MODE="--cleanup" ;;
 	--update) MODE="--update" ;;
+	--recover) MODE="--recover" ;;
 	--verify) MODE="--verify" ;;
 	--force) MODE="--force" ;;
 	--start-backup) MODE="--start-backup" ;;
@@ -2832,6 +3203,13 @@ case "$MODE" in
 		exit 0
 	fi
 	;;
+"--recover")
+	if [[ "$DAEMON_RUNNING" == "true" ]]; then
+		touch "$TRIGGER_RECOVERY"
+		notify_daemon "perform RECOVERY"
+		exit 0
+	fi
+	;;
 "--scan")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
 		touch "$TRIGGER_SCAN"
@@ -2927,6 +3305,15 @@ case "$MODE" in
 "--monitor")
 	log "STARTUP: Monitor Mode Active. Interval: ${MONITOR_INTERVAL:-300}s"
 
+	# Post-(re)boot ghost-container catch. The daemon normally starts at boot
+	# (or Unraid array start), so this plays the role the standalone recovery
+	# tool's "At Startup of Array" hook used to: repair containers whose
+	# writable layer vanished across the reboot, before normal monitoring.
+	if [[ "${DOCKER_RECOVERY_ENABLE:-false}" == "true" && "${DOCKER_RECOVERY_RUN_ON_STARTUP:-true}" == "true" ]]; then
+		run_docker_recovery_task
+		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$(date +%s)"
+	fi
+
 	# State tracking to prevent log flooding
 	WAS_BACKUP_PAUSED="false"
 
@@ -2938,6 +3325,7 @@ case "$MODE" in
 		check_backup_scheduler
 		check_cleanup_scheduler
 		check_update_scheduler
+		check_recovery_interval
 
 		# 2. Deep Verify (Blocking)
 		if check_verify_scheduler; then
@@ -2988,6 +3376,20 @@ case "$MODE" in
 "--update")
 	log "STARTUP: Forced Docker Update Mode (Standalone)"
 	run_docker_update_task
+	;;
+
+"--recover")
+	log "STARTUP: Forced Container Recovery Mode (Standalone)"
+	# Honour standalone-only diagnostic flags. A running daemon, when signalled,
+	# uses its DOCKER_RECOVERY_* config instead (these don't cross the IPC).
+	for _rec_arg in "$@"; do
+		case "$_rec_arg" in
+		--dry-run) DOCKER_RECOVERY_DRYRUN=true ;;
+		--no-recreate) DOCKER_RECOVERY_NO_RECREATE=true ;;
+		esac
+	done
+	run_docker_recovery_task
+	exit $?
 	;;
 
 "--start-backup")
