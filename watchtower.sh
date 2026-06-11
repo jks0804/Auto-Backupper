@@ -96,10 +96,23 @@ DOCKER_RECOVERY_RUN_ON_STARTUP=true
 DOCKER_RECOVERY_INTERVAL=3600
 DOCKER_RECOVERY_NO_RECREATE=false
 DOCKER_RECOVERY_DRYRUN=false
-# Docker states treated as a broken "ghost" to recover. A non-running container
-# in ANY other state (notably a clean "exited") is treated as intentionally
-# stopped and left untouched — recovery never starts a container you stopped.
+# How recovery decides a non-running container should be brought back:
+#   autostart — recover anything Unraid is set to autostart that isn't running
+#               (catches stopped/errored/missing); leave autostart-off alone.
+#   states    — recover only DOCKER_RECOVERY_GHOST_STATES below; ignore autostart.
+DOCKER_RECOVERY_DETECT="autostart"
+# Unraid's autostart list (one managed container name per line). Read for the
+# "autostart" detect mode; lives on the host so it's readable even for missing
+# containers. Override if your Unraid version stores it elsewhere.
+DOCKER_AUTOSTART_FILE="/var/lib/docker/unraid-autostart"
+# Used by DOCKER_RECOVERY_DETECT=states, and as the fallback when the autostart
+# list can't be read. A non-running container in ANY other state (notably a
+# clean "exited") is then treated as intentionally stopped and left untouched.
 DOCKER_RECOVERY_GHOST_STATES="created dead restarting"
+# Also recover a MISSING container (no docker record) when its template's image
+# is still present (an "orphaned image") — even if autostart is off/unreadable.
+# The leftover image is treated as proof it was installed and vanished.
+DOCKER_RECOVERY_USE_ORPHAN_IMAGES=true
 DOCKER_TEMPLATE_DIR="/boot/config/plugins/dockerMan/templates-user"
 DOCKER_RECOVERY_DIR="/boot/config/ab_recovery"
 
@@ -756,13 +769,22 @@ check_update_scheduler() {
 #
 # Each pass: for every container backed by an Unraid user template, healthy
 # (running) ones get their "recovery recipe" (the exact docker run, reconstructed
-# from `docker inspect`) refreshed on flash. A container that is merely STOPPED
-# (state "exited"/"paused"/etc.) is treated as intentionally down and left
-# exactly as-is — recovery NEVER starts a container you stopped on purpose. Only
-# containers in an abnormal/ghost state (DOCKER_RECOVERY_GHOST_STATES, default
-# created/dead/restarting) are recovered: `docker start` is tried first and, if
-# that fails and recreate is allowed, the container is removed and recreated from
-# the recipe with its Unraid GUI labels preserved so it stays managed.
+# from `docker inspect`) refreshed on flash. A non-running one is recovered only
+# if it is supposed to be running, decided by DOCKER_RECOVERY_DETECT:
+#   autostart (default) — recover anything Unraid is set to autostart that isn't
+#       running. Because the autostart list lives on the host, this catches
+#       stopped, errored AND completely missing (orphaned) containers, while
+#       leaving autostart-OFF containers (deliberately stopped) untouched.
+#   states — recover only containers in DOCKER_RECOVERY_GHOST_STATES (default
+#       created/dead/restarting); a clean "exited" is treated as intentionally
+#       stopped. (Also the fallback when the autostart list can't be read.)
+# To recover: `docker start` is tried first and, if that fails and recreate is
+# allowed, the container is removed (if present) and recreated from the best
+# blueprint available — a live `docker inspect`, the saved recipe, or (last
+# resort, via php) the container's Unraid template — with its GUI labels
+# preserved so it stays managed. A true ghost ("RWLayer unexpectedly nil") can't
+# be inspected, so the recipe/template path is what actually rebuilds it. Either
+# way recovery NEVER starts a container that is not supposed to be running.
 #
 # DATA SAFETY: app data lives in the bind-mounted appdata paths, not in the
 # container. Removing/recreating a container does not touch those paths. This
@@ -777,8 +799,11 @@ check_update_scheduler() {
 # them through every call. Declared here to stay set -u safe.
 declare -A _REC_TEMPLATE_OF=()
 declare -A _REC_STATE_OF=()
+declare -A _REC_AUTOSTART_ON=()       # set of container names Unraid is set to autostart
+_REC_AUTOSTART_AVAILABLE=0            # 1 once the autostart list was read this pass
 declare -a _REC_RUN_ARGS=()
-declare -i _REC_N_OK=0 _REC_N_GHOST=0 _REC_N_SKIPPED=0 _REC_N_START=0 _REC_N_RECREATE=0 _REC_N_MANUAL=0 _REC_N_ERROR=0
+_REC_CANDIDATE_REASON=""               # why the last candidate matched: autostart|orphan-image|ghost-state
+declare -i _REC_N_OK=0 _REC_N_GHOST=0 _REC_N_SKIPPED=0 _REC_N_IMG=0 _REC_N_START=0 _REC_N_RECREATE=0 _REC_N_MANUAL=0 _REC_N_ERROR=0
 
 # Reconstruct a container's `docker run` invocation from its (surviving) config
 # into _REC_RUN_ARGS. Returns 1 if the container can't be inspected (the caller
@@ -888,6 +913,107 @@ _recovery_printable_cmd() {   # human-readable, copy-pasteable
 	printf '%s' "$out"
 }
 
+# Reconstruct _REC_RUN_ARGS from a container's Unraid template — the last-resort
+# source for a ghost that can't be inspected ("RWLayer unexpectedly nil") and has
+# no saved recipe (the only blueprint left is the user template the GUI installs
+# from). Parsed with php (SimpleXML), emitted NUL-delimited so values with
+# spaces/commas/quotes survive. php ships with Unraid; without it this fallback
+# is skipped. Returns 1 if there's no template, no php, or nothing usable parses.
+_recovery_build_run_args_from_template() {
+	local name="$1" tmpl="${_REC_TEMPLATE_OF[$name]:-}"
+	[[ -n "$tmpl" && -f "$tmpl" ]] || return 1
+	command -v php >/dev/null 2>&1 || return 1
+	local parser
+	parser=$(mktemp) || return 1
+	cat >"$parser" <<'PHP'
+<?php
+// Build a `docker run` arg list from an Unraid container template, NUL-delimited.
+$f = $argv[1] ?? '';
+if ($f === '' || !is_file($f)) { exit(1); }
+$xml = @simplexml_load_file($f);
+if ($xml === false) { exit(1); }
+
+// Minimal shell-style tokenizer for ExtraParams / PostArgs (handles quotes).
+function tok($s) {
+  $t=[]; $cur=''; $inS=false; $inD=false; $has=false; $n=strlen($s);
+  for ($i=0;$i<$n;$i++){ $c=$s[$i];
+    if ($inS){ if($c=="'") $inS=false; else $cur.=$c; continue; }
+    if ($inD){ if($c=='"') $inD=false; elseif($c=='\\' && $i+1<$n && strpos('"\\$',$s[$i+1])!==false){ $cur.=$s[++$i]; } else $cur.=$c; continue; }
+    if ($c=="'"){ $inS=true; $has=true; continue; }
+    if ($c=='"'){ $inD=true; $has=true; continue; }
+    if ($c===' '||$c==="\t"||$c==="\n"||$c==="\r"){ if($has){$t[]=$cur;$cur='';$has=false;} continue; }
+    $cur.=$c; $has=true;
+  }
+  if ($has) $t[]=$cur;
+  return $t;
+}
+
+$args=['run','-d'];
+$name=trim((string)$xml->Name);
+if ($name==='') exit(1);
+$args[]='--name'; $args[]=$name;
+
+$net=trim((string)$xml->Network); $netl=strtolower($net);
+if ($net!=='' && $netl!=='default'){ $args[]='--network'; $args[]=$net; }
+if (strtolower(trim((string)$xml->Privileged))==='true'){ $args[]='--privileged'; }
+
+foreach (tok(trim((string)$xml->ExtraParams)) as $a){ if($a!=='') $args[]=$a; }
+
+foreach ($xml->Config as $c){
+  $type=(string)$c['Type']; $target=trim((string)$c['Target']); $mode=trim((string)$c['Mode']);
+  $val=trim((string)$c); if ($val==='') $val=trim((string)$c['Default']);
+  switch ($type){
+    case 'Port':     if($netl!=='host' && $val!=='' && $target!==''){ $args[]='-p'; $args[]=$val.':'.$target.($mode!==''?'/'.$mode:''); } break;
+    case 'Variable': if($target!==''){ $args[]='-e'; $args[]=$target.'='.$val; } break;
+    case 'Path':     if($val!=='' && $target!==''){ $args[]='-v'; $args[]=$val.':'.$target.($mode!==''?':'.$mode:''); } break;
+    case 'Label':    if($target!==''){ $args[]='--label'; $args[]=$target.'='.$val; } break;
+    case 'Device':   if($val!==''){ $args[]='--device'; $args[]=($target!==''?$val.':'.$target:$val); } break;
+  }
+}
+
+$myip=trim((string)$xml->MyIP);
+if ($myip!=='' && !in_array($netl,['','bridge','host','none','default'],true)){ $args[]='--ip'; $args[]=$myip; }
+
+$repo=trim((string)$xml->Repository);
+if ($repo==='') exit(1);
+$args[]=$repo;
+
+foreach (tok(trim((string)$xml->PostArgs)) as $a){ if($a!=='') $args[]=$a; }
+
+foreach ($args as $a){ echo $a."\0"; }
+PHP
+	_REC_RUN_ARGS=()
+	# Pipe NUL output straight into mapfile (a bash var can't hold NULs).
+	mapfile -d '' _REC_RUN_ARGS < <(php "$parser" "$tmpl" 2>/dev/null)
+	rm -f "$parser"
+	((${#_REC_RUN_ARGS[@]} >= 5))   # run -d --name <name> <image> at minimum
+}
+
+# UNRAID ONLY: ensure the recreated container carries dockerMan's management
+# labels, so the GUI shows version/autostart and allows Edit (without
+# net.unraid.docker.managed it appears as a "3rd party" container). dockerMan
+# stamps these; our blueprints can lack them (a label-less saved recipe, or the
+# generic template translation), so splice in any that are missing right after
+# `run -d`. icon/webui come from the template. No-op off Unraid (OS_TYPE is set
+# in section 2) — those labels are meaningless on OMV / generic Linux.
+_recovery_ensure_unraid_labels() {
+	[[ "${OS_TYPE:-linux}" == "unraid" ]] || return 0
+	local name="$1" tmpl="${_REC_TEMPLATE_OF[$name]:-}" icon="" webui="" key a found
+	local -a want=("net.unraid.docker.managed=dockerman") ins=()
+	if [[ -n "$tmpl" && -f "$tmpl" ]]; then
+		icon=$(sed -n 's:.*<Icon>\(.*\)</Icon>.*:\1:p' "$tmpl" | head -n1)
+		webui=$(sed -n 's:.*<WebUI>\(.*\)</WebUI>.*:\1:p' "$tmpl" | head -n1)
+		[[ -n "$icon" ]]  && want+=("net.unraid.docker.icon=$icon")
+		[[ -n "$webui" ]] && want+=("net.unraid.docker.webui=$webui")
+	fi
+	for key in "${want[@]}"; do
+		found=0
+		for a in "${_REC_RUN_ARGS[@]}"; do [[ "$a" == "$key" ]] && { found=1; break; }; done
+		((found)) || ins+=(--label "$key")
+	done
+	((${#ins[@]})) && _REC_RUN_ARGS=("${_REC_RUN_ARGS[@]:0:2}" "${ins[@]}" "${_REC_RUN_ARGS[@]:2}")
+}
+
 # Recover one broken ("ghost") container. Increments the _REC_N_* counters.
 _recovery_one() {
 	local name="$1" st newid
@@ -915,13 +1041,16 @@ _recovery_one() {
 	if ! _recovery_build_run_args "$name"; then
 		if _recovery_load_args "$name"; then
 			log "RECOVERY: $name not inspectable; using saved recovery recipe."
+		elif _recovery_build_run_args_from_template "$name"; then
+			log "RECOVERY: $name not inspectable and no saved recipe; rebuilding from Unraid template."
 		else
-			log "WARN: RECOVERY — cannot inspect $name and no saved recipe exists. Re-add it from its template."
+			log "WARN: RECOVERY — cannot inspect $name, no saved recipe, and no usable template. Re-add it from its template (Apps -> Previous Apps)."
 			_REC_N_MANUAL+=1
 			return 1
 		fi
 	fi
 
+	_recovery_ensure_unraid_labels "$name"
 	log "RECOVERY: plan: $(_recovery_printable_cmd)"
 	if [[ "${DOCKER_RECOVERY_DRYRUN:-false}" == "true" ]]; then
 		log "RECOVERY: dry-run — not removing/recreating $name."
@@ -948,14 +1077,76 @@ _recovery_one() {
 
 # Is this docker state one we treat as a broken "ghost" to recover? A non-running
 # container in any other state (notably a clean "exited") is treated as
-# intentionally stopped and left untouched. Config-tunable for environments
-# where ghosts present differently.
+# intentionally stopped and left untouched. Used only by the "states" detect mode
+# (and as the fallback when the autostart list can't be read).
 _recovery_state_is_ghost() {
 	local state="$1" g
 	# Unquoted on purpose: split the space-separated state list into words.
 	for g in ${DOCKER_RECOVERY_GHOST_STATES:-created dead restarting}; do
 		[[ "$state" == "$g" ]] && return 0
 	done
+	return 1
+}
+
+# Load Unraid's "autostart-enabled" set into _REC_AUTOSTART_ON from the autostart
+# list file (one managed container name per line; an optional wait value may
+# follow on the line, so we take the first whitespace-delimited token). The file
+# lives on the host, not inside a container, so it is readable even when a
+# container's record is gone — which is how autostart detection catches missing
+# (orphaned) containers too. Sets _REC_AUTOSTART_AVAILABLE=1 and returns 0 on a
+# successful read; returns 1 if the file isn't readable.
+_recovery_load_autostart() {
+	_REC_AUTOSTART_ON=()
+	_REC_AUTOSTART_AVAILABLE=0
+	local asf="${DOCKER_AUTOSTART_FILE:-/var/lib/docker/unraid-autostart}"
+	[[ -r "$asf" ]] || return 1
+	local line n
+	while IFS= read -r line; do
+		line="${line#"${line%%[![:space:]]*}"}"   # strip leading whitespace
+		[[ -z "$line" || "$line" == \#* ]] && continue
+		n="${line%%[[:space:]]*}"                  # first token = container name
+		[[ -n "$n" ]] && _REC_AUTOSTART_ON["$n"]=1
+	done <"$asf"
+	_REC_AUTOSTART_AVAILABLE=1
+	return 0
+}
+
+# Is the template's image present on disk? A MISSING container whose image is
+# still here was installed and has since vanished (an "orphaned image" in Unraid
+# terms) — strong evidence it should be recovered. Reads <Repository> from the
+# template and asks docker if that image exists. (For a container that still has
+# a record, its image is referenced and so never looks orphaned — which is why
+# this trigger is scoped to __none__ and can't start a deliberately-stopped one.)
+_recovery_image_present() {
+	local name="$1" tmpl="${_REC_TEMPLATE_OF[$name]:-}" repo
+	[[ -n "$tmpl" && -f "$tmpl" ]] || return 1
+	command -v docker >/dev/null 2>&1 || return 1
+	repo=$(sed -n 's:.*<Repository>\(.*\)</Repository>.*:\1:p' "$tmpl" | head -n1 | tr -d ' \t\r')
+	[[ -n "$repo" ]] || return 1
+	docker image inspect "$repo" >/dev/null 2>&1
+}
+
+# Decide whether a non-running template-backed container (state may be __none__,
+# i.e. no container record at all) should be recovered, and record why in
+# _REC_CANDIDATE_REASON. Primary signal is DOCKER_RECOVERY_DETECT:
+#   autostart — "should be running" == Unraid autostart enabled (catches
+#       exited/created/dead AND missing), leaving autostart-off alone;
+#   states    — fall back to the DOCKER_RECOVERY_GHOST_STATES allowlist.
+# On TOP of that, when DOCKER_RECOVERY_USE_ORPHAN_IMAGES=true, a MISSING (__none__)
+# container whose template image is still present is recovered regardless of
+# autostart — the leftover image is treated as proof it was installed and is gone.
+_recovery_is_candidate() {
+	local name="$1" state="$2"
+	_REC_CANDIDATE_REASON=""
+	if [[ "${DOCKER_RECOVERY_DETECT:-autostart}" == "autostart" && "$_REC_AUTOSTART_AVAILABLE" == "1" ]]; then
+		if [[ -n "${_REC_AUTOSTART_ON[$name]:-}" ]]; then _REC_CANDIDATE_REASON="autostart"; return 0; fi
+	elif [[ "$state" != "__none__" ]] && _recovery_state_is_ghost "$state"; then
+		_REC_CANDIDATE_REASON="ghost-state"; return 0
+	fi
+	# Orphaned/leftover-image trigger (missing container + image still present).
+	if [[ "${DOCKER_RECOVERY_USE_ORPHAN_IMAGES:-true}" == "true" && "$state" == "__none__" ]] && _recovery_image_present "$name"; then
+		_REC_CANDIDATE_REASON="orphan-image"; return 0
+	fi
 	return 1
 }
 
@@ -987,8 +1178,11 @@ run_docker_recovery_task() {
 	# Reset per-pass state.
 	_REC_TEMPLATE_OF=()
 	_REC_STATE_OF=()
+	_REC_AUTOSTART_ON=()
+	_REC_AUTOSTART_AVAILABLE=0
 	_REC_RUN_ARGS=()
-	_REC_N_OK=0; _REC_N_GHOST=0; _REC_N_SKIPPED=0; _REC_N_START=0; _REC_N_RECREATE=0; _REC_N_MANUAL=0; _REC_N_ERROR=0
+	_REC_CANDIDATE_REASON=""
+	_REC_N_OK=0; _REC_N_GHOST=0; _REC_N_SKIPPED=0; _REC_N_IMG=0; _REC_N_START=0; _REC_N_RECREATE=0; _REC_N_MANUAL=0; _REC_N_ERROR=0
 
 	# Map Unraid user template name -> template file.
 	local tdir="${DOCKER_TEMPLATE_DIR:-/boot/config/plugins/dockerMan/templates-user}"
@@ -1015,6 +1209,16 @@ run_docker_recovery_task() {
 		[[ -n "$cname" ]] && _REC_STATE_OF["$cname"]="$cstate"
 	done < <(docker ps -a --format '{{.Names}}\t{{.State}}')
 
+	# Load the "should be running" signal. In autostart mode this is Unraid's
+	# autostart list; when it can't be read, fall back to the state allowlist.
+	if [[ "${DOCKER_RECOVERY_DETECT:-autostart}" == "autostart" ]]; then
+		if _recovery_load_autostart; then
+			log "RECOVERY: autostart detection — ${#_REC_AUTOSTART_ON[@]} container(s) marked autostart in ${DOCKER_AUTOSTART_FILE:-/var/lib/docker/unraid-autostart}."
+		else
+			log "WARN: RECOVERY — autostart list not readable (${DOCKER_AUTOSTART_FILE:-/var/lib/docker/unraid-autostart}); falling back to state-based detection. Set DOCKER_AUTOSTART_FILE if your path differs."
+		fi
+	fi
+
 	local name state
 	local TNAMES=()
 	mapfile -t TNAMES < <(printf '%s\n' "${!_REC_TEMPLATE_OF[@]}" | sort)
@@ -1024,21 +1228,23 @@ run_docker_recovery_task() {
 			_REC_N_OK+=1
 			# Keep the recipe fresh while the container is healthy.
 			_recovery_build_run_args "$name" && _recovery_save_args "$name"
-		elif [[ "$state" == "__none__" ]]; then
-			:   # template exists, no container — normal; nothing to do
-		elif _recovery_state_is_ghost "$state"; then
+		elif _recovery_is_candidate "$name" "$state"; then
 			_REC_N_GHOST+=1
-			log "RECOVERY: ghost: $name (state=$state) — attempting recovery."
+			[[ "$_REC_CANDIDATE_REASON" == "orphan-image" ]] && _REC_N_IMG+=1
+			log "RECOVERY: $name needs recovery (state=$state, via $_REC_CANDIDATE_REASON) — attempting."
 			_recovery_one "$name"
+		elif [[ "$state" == "__none__" ]]; then
+			:   # template exists, no container, not a recovery candidate — uninstalled/normal
 		else
-			# Merely stopped (exited/paused/…). Treat as intentionally down and
-			# leave it EXACTLY as-is — never start a container the user stopped.
+			# Exists, not running, not a candidate (autostart-off, or a non-ghost
+			# state in states mode). Intentionally down — leave it EXACTLY as-is.
 			_REC_N_SKIPPED+=1
-			log "RECOVERY: leaving $name as-is (state=$state) — intentionally stopped, not a ghost state."
+			log "RECOVERY: leaving $name as-is (state=$state) — not a recovery candidate (intentionally stopped)."
 		fi
 	done
 
-	log "RECOVERY: summary: ${_REC_N_OK} healthy, ${_REC_N_GHOST} ghost(s), ${_REC_N_SKIPPED} left stopped | recovered ${_REC_N_START} via start, ${_REC_N_RECREATE} via recreate | ${_REC_N_MANUAL} need manual action, ${_REC_N_ERROR} error(s)."
+	log "RECOVERY: summary: ${_REC_N_OK} healthy, ${_REC_N_GHOST} to recover, ${_REC_N_SKIPPED} left stopped | recovered ${_REC_N_START} via start, ${_REC_N_RECREATE} via recreate | ${_REC_N_MANUAL} need manual action, ${_REC_N_ERROR} error(s)."
+	((_REC_N_IMG > 0)) && log "RECOVERY: ${_REC_N_IMG} of those were missing containers flagged by a leftover/orphaned image (template + image present, no container)."
 	log "RECOVERY: ===== Container recovery end ====="
 
 	if ((_REC_N_START > 0 || _REC_N_RECREATE > 0)); then
