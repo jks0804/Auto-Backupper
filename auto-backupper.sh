@@ -812,14 +812,19 @@ cleanup() {
 	# artifacts) — but until the lock is actually held, the paths below
 	# belong to another instance and must not be touched.
 	[[ "$LOCK_HELD" -eq 1 ]] || return 0
-	rm -f "$RUNNING_CONTAINERS_LIST" 2>/dev/null || true
-	rm -f "$BACKUP_PIDFILE" 2>/dev/null || true
-	rm -rf "$IPC_BASE" 2>/dev/null || true
+	# Absolute /bin/rm here (not the bare `rm`): these artifacts are
+	# created for real on every run — including dry-run, where init_state
+	# uses /bin/mkdir and the PID/lock files are written before the [DRY]
+	# overrides matter. A bare `rm` would hit the dry-run no-op stub and
+	# leave the whole enclave + PID + lockfile on disk after every dry-run.
+	/bin/rm -f "$RUNNING_CONTAINERS_LIST" 2>/dev/null || true
+	/bin/rm -f "$BACKUP_PIDFILE" 2>/dev/null || true
+	/bin/rm -rf "$IPC_BASE" 2>/dev/null || true
 	# Unlink while still holding the flock: a concurrent starter that opens
 	# the file between our unlock and unlink would otherwise acquire a lock
 	# on an inode we're about to delete, letting a third instance open a
 	# fresh file and lock it independently (no mutual exclusion).
-	rm -f "$LOCKFILE" 2>/dev/null || true
+	/bin/rm -f "$LOCKFILE" 2>/dev/null || true
 	flock -u "${LOCKFD}" 2>/dev/null || true
 }
 
@@ -1562,7 +1567,15 @@ rotation_phase() {
 	local grace_skip_count=0
 	local now_epoch
 	now_epoch=$(date +%s)
-	local grace_seconds=$(( ${ROTATE_UNSTAMPED_GRACE_HOURS:-24} * 3600 ))
+	# Coerce a malformed config value back to the default rather than let
+	# it abort the run (a non-numeric token under set -u raises an
+	# unbound-variable error inside $(( )) ) or silently disable rotation
+	# (a value like "24h" fails the arithmetic and, masked by `local`,
+	# would early-return the whole function). Mirrors how ROTATE_DAYS is
+	# treated defensively elsewhere.
+	local grace_hours="${ROTATE_UNSTAMPED_GRACE_HOURS:-24}"
+	[[ "$grace_hours" =~ ^[0-9]+$ ]] || grace_hours=24
+	local grace_seconds=$(( grace_hours * 3600 ))
 	while IFS= read -r -d '' old_file; do
 		local d
 		d="$(rotation_date_for "$old_file" "$BACKUP_BASE")"
@@ -1703,7 +1716,9 @@ produce_flow() {
 						log "ERROR: SQL Dump failed for $db"
 						ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 					fi
-					rm -rf "$tmp_dir"
+					# /bin/rm: mktemp -d is not stubbed in dry-run, so this
+					# tempdir is real and the bare (shadowed) rm would leak it.
+					/bin/rm -rf "$tmp_dir"
 				done
 			else
 				log "WARN: SQL Container $SQL_CONTAINER_NAME not running."
@@ -1777,7 +1792,8 @@ EOF
 							log "ERROR: Mongo dump failed for $mdb"
 							ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 						fi
-						rm -rf "$tmp_dir"
+						# /bin/rm: real tempdir even in dry-run (see SQL note).
+						/bin/rm -rf "$tmp_dir"
 					done
 
 					# Scrub container-side creds as soon as we're done with
@@ -1790,10 +1806,13 @@ EOF
 				# paths. Prefer shred when available so the content isn't
 				# recoverable from free inodes.
 				if [[ -n "$mongo_host_creds" && -f "$mongo_host_creds" ]]; then
+					# /bin/rm in the fallback: this file holds the plaintext
+					# MONGO_PASS. mktemp creates it for real even in dry-run, so a
+					# bare (shadowed) rm would leave the password in /tmp.
 					if command -v shred >/dev/null 2>&1; then
-						shred -u "$mongo_host_creds" 2>/dev/null || rm -f "$mongo_host_creds"
+						shred -u "$mongo_host_creds" 2>/dev/null || /bin/rm -f "$mongo_host_creds"
 					else
-						rm -f "$mongo_host_creds"
+						/bin/rm -f "$mongo_host_creds"
 					fi
 				fi
 			fi
@@ -1824,7 +1843,8 @@ EOF
 					log "ERROR: Redis dump failed"
 					ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 				fi
-				rm -rf "$tmp_dir"
+				# /bin/rm: real tempdir even in dry-run (see SQL note).
+				/bin/rm -rf "$tmp_dir"
 			else
 				log "WARN: Redis Container $REDIS_CONTAINER_NAME not running."
 			fi
