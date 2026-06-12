@@ -480,18 +480,29 @@ daemon_signal_handler() {
 # kill (the default KillMode=control-group) also signals the child tasks
 # directly, which this cannot intercept — use KillMode=mixed in the unit if you
 # schedule updates near array-stop/shutdown windows.
+# Drop completed PIDs so _BG_TASK_PIDS stays small (it would otherwise grow
+# unbounded over a long-running daemon) and never matches a recycled PID at
+# shutdown. Called right before each new background task is appended.
+_bg_reap() {
+	local _p _live=()
+	for _p in ${_BG_TASK_PIDS[@]+"${_BG_TASK_PIDS[@]}"}; do
+		kill -0 "$_p" 2>/dev/null && _live+=("$_p")
+	done
+	_BG_TASK_PIDS=(${_live[@]+"${_live[@]}"})
+}
+
 _daemon_shutdown() {
-	local grace="${DAEMON_SHUTDOWN_GRACE:-30}" p waited
+	local grace="${DAEMON_SHUTDOWN_GRACE:-30}" p
 	[[ "$grace" =~ ^[0-9]+$ ]] || grace=30
+	# ONE total deadline shared across all tracked PIDs (not a per-PID budget),
+	# so shutdown can never block longer than DAEMON_SHUTDOWN_GRACE in aggregate
+	# even if several entries are still alive (or are recycled PIDs).
+	local deadline=$((SECONDS + grace))
 	for p in ${_BG_TASK_PIDS[@]+"${_BG_TASK_PIDS[@]}"}; do
 		kill -0 "$p" 2>/dev/null || continue
-		log "SHUTDOWN: waiting up to ${grace}s for in-flight task (pid $p) to finish..."
-		waited=0
-		while kill -0 "$p" 2>/dev/null && ((waited < grace)); do
-			sleep 1
-			waited=$((waited + 1))
-		done
-		kill -0 "$p" 2>/dev/null && log "SHUTDOWN: task $p still running after ${grace}s; leaving it to finish."
+		((SECONDS >= deadline)) && { log "SHUTDOWN: grace (${grace}s) elapsed; leaving remaining task(s) to finish."; break; }
+		log "SHUTDOWN: waiting (up to ${grace}s total) for in-flight task (pid $p) to finish..."
+		while kill -0 "$p" 2>/dev/null && ((SECONDS < deadline)); do sleep 1; done
 	done
 	rm -f "$PID_FILE" "$STATUS_FILE" 2>/dev/null || true
 }
@@ -609,9 +620,13 @@ file_is_stable() {
 	# gated off whenever is_backup_running — see the monitor loop and
 	# check_manual_triggers — so this primarily protects against out-of-band
 	# uploads writing directly into WATCH_DIR.)
-	local samples="${SCAN_STABLE_SAMPLES:-3}"
-	local interval="${SCAN_STABLE_INTERVAL:-2}"
-	local min_age="${SCAN_STABLE_MIN_AGE:-15}"
+	# Optional overrides (min_age, samples, interval) let a caller use a lighter
+	# check than the scan's conservative defaults. The internal mover passes a
+	# short window so it isn't slowed to ~scan speed or made to skip files that
+	# only just finished writing — see trigger_mover.
+	local min_age="${2:-${SCAN_STABLE_MIN_AGE:-15}}"
+	local samples="${3:-${SCAN_STABLE_SAMPLES:-3}}"
+	local interval="${4:-${SCAN_STABLE_INTERVAL:-2}}"
 	[[ "$samples"  =~ ^[0-9]+$ ]] || samples=3
 	[[ "$interval" =~ ^[0-9]+$ ]] || interval=2
 	[[ "$min_age"  =~ ^[0-9]+$ ]] || min_age=15
@@ -621,7 +636,13 @@ file_is_stable() {
 	now=$(date +%s)
 	if ! mtime=$(timeout 2s stat -c%Y "$file" 2>/dev/null); then return 1; fi
 	[[ "$mtime" =~ ^[0-9]+$ ]] || return 1
-	((now - mtime < min_age)) && return 1
+	# Apply the min-age gate only when mtime is in the past. A future mtime (NTP
+	# skew, a -p-preserved timestamp) would otherwise make the file look
+	# perpetually "too young" and never stabilise — so it would never be
+	# checksummed by the scan nor moved off a full cache by the internal mover.
+	if ((now >= mtime)); then
+		((now - mtime < min_age)) && return 1
+	fi
 
 	local prev="" sig i
 	for ((i = 0; i < samples; i++)); do
@@ -701,7 +722,12 @@ trigger_mover() {
 		# (not transferred -> --remove-source-files won't delete it) rather than
 		# clobbering the newer copy and deleting the source.
 		find "$CACHE_DIR" -name ".abpartial" -prune -o -type f -print0 | while IFS= read -r -d '' src; do
-			if file_is_stable "$src"; then
+			# Lighter stability check than the integrity scan: a short 5s quiet
+			# window + 2 quick samples (~1s), so the inline mover doesn't stall
+			# the monitor loop (~scan cost per file) or skip a file that only
+			# just finished writing. In-progress rsync transfers are already
+			# excluded by the .abpartial prune above and protected by --update.
+			if file_is_stable "$src" 5 2 1; then
 				local rel="${src#"$CACHE_DIR"/}"
 				local dest="$ARRAY_BASE_PATH/$rel"
 				mkdir -p "$(dirname "$dest")"
@@ -731,8 +757,12 @@ manage_cache_state() {
 		# contention that slows parity and extends the reduced-redundancy
 		# window. The lower THRESHOLD branch already does this; the critical
 		# branch used to skip it and start the mover mid-parity.
-		if is_parity_running && [[ "${RUN_MOVER_DURING_PARITY:-false}" != "true" ]]; then
-			log "Cache critical (${usage}%) but a parity check is running; deferring mover (set RUN_MOVER_DURING_PARITY=true to override)."
+		# Defer during a parity check unless explicitly overridden. FORCE_MOVER_ON_CRITICAL
+		# is the operator's "run the mover at critical fill no matter what" escape
+		# hatch, so it must bypass the parity guard too — otherwise a cache could
+		# climb to 100% during a multi-hour parity check with no way through.
+		if is_parity_running && [[ "${RUN_MOVER_DURING_PARITY:-false}" != "true" && "${FORCE_MOVER_ON_CRITICAL:-false}" != "true" ]]; then
+			log "Cache critical (${usage}%) but a parity check is running; deferring mover (set RUN_MOVER_DURING_PARITY=true or FORCE_MOVER_ON_CRITICAL=true to override)."
 			return
 		fi
 		if is_backup_running && [[ "${FORCE_MOVER_ON_CRITICAL:-false}" != "true" ]]; then return; fi
@@ -839,6 +869,7 @@ check_update_scheduler() {
 	[[ "${UPDATE_SCHEDULER_ENABLE:-false}" != "true" ]] && return
 	is_backup_running && return
 	if [[ "$(should_run_schedule "$UPDATE_SCHEDULER_MODE" "$UPDATE_SCHEDULER_VALUE" "$UPDATE_SCHEDULER_TIME" "$LAST_RUN_UPDATE")" == "true" ]]; then
+		_bg_reap   # drop finished PIDs before tracking the new one
 		run_docker_update_task &
 		_BG_TASK_PIDS+=($!)   # tracked so the shutdown handler can wait on it
 		atomic_write "$LAST_RUN_UPDATE" "$(date +%Y%m%d)"
@@ -944,18 +975,29 @@ _recovery_build_run_args() {
 	user=$(docker inspect -f '{{.Config.User}}' "$name")
 	[[ -n "$user" ]] && _REC_RUN_ARGS+=(--user "$user")
 
-	# --entrypoint: docker run takes a single entrypoint string. Reconstruct the
-	# common single-element case faithfully; for a multi-element entrypoint, run
-	# flags can't express the extra elements, so emit the first and warn rather
-	# than silently producing a container that runs the image-default entrypoint.
-	local -a ep=()
+	# --entrypoint: docker inspect reports the EFFECTIVE entrypoint, which
+	# INCLUDES the image's own ENTRYPOINT. Emit --entrypoint ONLY when the
+	# container actually OVERRIDES the image's entrypoint — otherwise the image
+	# default already applies and forcing it is at best redundant and, for a
+	# multi-element image entrypoint (e.g. ["/usr/bin/tini","--"]), would be
+	# truncated to the first element and break the container. docker run can
+	# express only a single entrypoint string, so a genuine multi-element
+	# override can't be faithfully rebuilt: leave the image default and warn,
+	# rather than recreate a knowingly-broken container.
+	local -a ep=() img_ep=()
 	while IFS= read -r line; do ep+=("$line"); done \
 		< <(docker inspect -f '{{range .Config.Entrypoint}}{{println .}}{{end}}' "$name")
-	if ((${#ep[@]} == 1)); then
-		_REC_RUN_ARGS+=(--entrypoint "${ep[0]}")
-	elif ((${#ep[@]} > 1)); then
-		_REC_RUN_ARGS+=(--entrypoint "${ep[0]}")
-		log "WARN: RECOVERY — $name has a multi-element entrypoint; only the first element ('${ep[0]}') is reconstructed. Verify the recreated container."
+	while IFS= read -r line; do img_ep+=("$line"); done \
+		< <(docker image inspect -f '{{range .Config.Entrypoint}}{{println .}}{{end}}' "$image" 2>/dev/null)
+	local ep_join img_join
+	printf -v ep_join '%s\n' ${ep[@]+"${ep[@]}"}
+	printf -v img_join '%s\n' ${img_ep[@]+"${img_ep[@]}"}
+	if [[ "$ep_join" != "$img_join" ]]; then
+		if ((${#ep[@]} == 1)); then
+			_REC_RUN_ARGS+=(--entrypoint "${ep[0]}")
+		elif ((${#ep[@]} > 1)); then
+			log "WARN: RECOVERY — $name overrides the image entrypoint with a multi-element value that 'docker run --entrypoint' cannot express; leaving the image default. Verify the recreated container and re-apply the override manually if needed."
+		fi
 	fi
 
 	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(-v "$line"); done \
@@ -1199,7 +1241,12 @@ _recovery_one() {
 	local backup_name=""
 	if docker inspect "$name" >/dev/null 2>&1; then
 		backup_name="${name}.ab-recovery-bak"
-		docker rm -f "$backup_name" >/dev/null 2>&1 || true   # clear any stale backup
+		# Docker names legally contain '.', so a real, suite-managed container
+		# could carry the backup suffix. Never clobber one: if a template exists
+		# for that name, uniquify ours so the rm -f below only ever targets a
+		# leftover of ours, never the user's container.
+		[[ -n "${_REC_TEMPLATE_OF[$backup_name]:-}" ]] && backup_name="${name}.ab-recovery-bak.$$"
+		docker rm -f "$backup_name" >/dev/null 2>&1 || true   # clear any stale backup of ours
 		if ! docker rename "$name" "$backup_name" >/dev/null 2>&1; then
 			# Rename unavailable — fall back to the old remove path so the name frees.
 			backup_name=""
@@ -1313,9 +1360,20 @@ _recovery_is_candidate() {
 	# list couldn't be read), and even then only when a saved recovery recipe
 	# exists — proof the daemon managed this container while it was healthy.
 	if [[ "${DOCKER_RECOVERY_USE_ORPHAN_IMAGES:-true}" == "true" && "$state" == "__none__" ]]; then
-		local autostart_authoritative=0
-		[[ "${DOCKER_RECOVERY_DETECT:-autostart}" == "autostart" && "$_REC_AUTOSTART_AVAILABLE" == "1" ]] && autostart_authoritative=1
-		if ((autostart_authoritative == 0)) \
+		# Fire ONLY in the degraded autostart fallback: detect mode is autostart
+		# but the list couldn't be read this pass. Rationale:
+		#   - autostart mode WITH a readable list: an autostart-ON missing
+		#     container is already handled above (reason=autostart) and an
+		#     autostart-OFF one is intentionally down — so orphan-image is inert.
+		#   - explicit states mode: the operator opted into state-based recovery
+		#     only; a record-less container has no state to match, so we must NOT
+		#     resurrect it (that was the bug — it brought back user-removed apps).
+		# Even in the fallback, require a saved recipe AND the image present as
+		# evidence the daemon managed this container while it was healthy. (The
+		# recipe is pruned when a removal is later observed — see
+		# run_docker_recovery_task's uninstalled branch — so a deliberately
+		# removed container can't be resurrected from a stale recipe.)
+		if [[ "${DOCKER_RECOVERY_DETECT:-autostart}" == "autostart" && "$_REC_AUTOSTART_AVAILABLE" != "1" ]] \
 			&& [[ -f "$DOCKER_RECOVERY_DIR/${name}.args" ]] \
 			&& _recovery_image_present "$name"; then
 			_REC_CANDIDATE_REASON="orphan-image"; return 0
@@ -1408,7 +1466,14 @@ run_docker_recovery_task() {
 			log "RECOVERY: $name needs recovery (state=$state, via $_REC_CANDIDATE_REASON) — attempting."
 			_recovery_one "$name"
 		elif [[ "$state" == "__none__" ]]; then
-			:   # template exists, no container, not a recovery candidate — uninstalled/normal
+			# Template exists, no container, not a recovery candidate — the
+			# container was uninstalled/removed (or is autostart-OFF and gone).
+			# Drop any stale recovery recipe so a later mode switch (states mode
+			# or an unreadable autostart list) can't resurrect it from a
+			# months-old recipe. In the default autostart-readable mode a
+			# removed non-autostart container reaches here, so its recipe is
+			# cleaned up even though orphan-image is inert in that mode.
+			[[ -f "$DOCKER_RECOVERY_DIR/${name}.args" ]] && rm -f "$DOCKER_RECOVERY_DIR/${name}.args"
 		else
 			# Exists, not running, not a candidate (autostart-off, or a non-ghost
 			# state in states mode). Intentionally down — leave it EXACTLY as-is.
@@ -1452,6 +1517,7 @@ check_recovery_interval() {
 	if ((now - last >= interval)); then
 		# Mark the epoch up front (before the &) so a long pass can't re-fire.
 		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$now"
+		_bg_reap   # drop finished PIDs before tracking the new one
 		run_docker_recovery_task &
 		_BG_TASK_PIDS+=($!)   # tracked so the shutdown handler can wait on it
 	fi
@@ -3870,6 +3936,17 @@ case "$MODE" in
 	monitor_logs
 	;;
 *)
+	# Standalone one-shot scan/verify (daemon not running). The IPC trigger path
+	# (check_manual_triggers) gates on is_backup_running; this CLI path must too,
+	# or `watchtower.sh --scan|--verify` while an independent backup (cron /
+	# --start-backup) holds BACKUP_LOCKFILE would walk the live, in-progress tree
+	# and could checksum a half-written archive. The watchtower flock is a
+	# DIFFERENT lock, so it doesn't exclude a running backup.
+	if is_backup_running; then
+		log "WARN: A backup is in progress; refusing to scan the live tree. Retry when idle."
+		echo "A backup is in progress; refusing to scan. Retry when the backup finishes." >&2
+		exit 1
+	fi
 	log "STARTUP: One-Time Scan Mode (Verify: ${ENABLE_VERIFICATION:-false})"
 	perform_scan "$WATCH_DIR" "${ENABLE_VERIFICATION:-false}"
 	;;

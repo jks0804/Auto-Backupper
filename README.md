@@ -326,6 +326,18 @@ This script acts as the "Cron" and "Health Monitor" of the suite. It is designed
 ./watchtower.sh --hub
 ```
 
+### Running under systemd
+
+On INT/TERM the daemon waits up to `DAEMON_SHUTDOWN_GRACE` seconds (default 30) for an in-flight Docker **update** or **recovery** pass to reach a safe point, so a stop signal can't orphan a container between `docker rm` and recreate. That graceful wait only helps when the signal targets the daemon process itself. systemd's default `KillMode=control-group` signals the daemon's child tasks **directly** too, which the daemon cannot intercept — so if you schedule Docker updates/recovery and run watchtower as a systemd unit, set:
+
+```
+[Service]
+KillMode=mixed
+TimeoutStopSec=60   # >= DAEMON_SHUTDOWN_GRACE
+```
+
+`KillMode=mixed` sends the stop signal only to the main daemon (letting its handler shepherd the children), and `TimeoutStopSec` must be at least `DAEMON_SHUTDOWN_GRACE` so systemd doesn't SIGKILL mid-recreate.
+
 ### Live Dashboard (`--ab-graph`)
 
 `--ab-graph` opens a read-only TUI that visualises a currently-running `auto-backupper.sh` or `auto-restorer.sh`. It's purely on-screen: nothing is written to disk and the underlying logs remain the system of record.
