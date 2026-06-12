@@ -66,6 +66,10 @@ CHECKSUM_DIR=".checksums"
 HOSTNAME_VAR="$(hostname | cut -d. -f1 | tr '[:lower:]' '[:upper:]')"
 CDATE=$(date +%Y%m%d)
 CURRENT_ARCHIVE_FILE=""
+# Count of archives that failed this run. try_archive increments it; the
+# end-of-produce notification reports it. A failed archive never aborts
+# the run — remaining archives, verification and rotation still execute.
+ARCHIVE_FAILURES=0
 
 # --- Log Rotation Settings (Defaults) ---
 LOG_MAX_SIZE="$((10 * 1024 * 1024))" # 10MB
@@ -203,7 +207,10 @@ log() {
 
 # State & IPC Management
 init_state() {
-	mkdir -p "$ENCLAVE_DIR"
+	# State/IPC bookkeeping lives under /tmp and is required for the run's
+	# own plumbing, so it is created for real even in dry-run mode (where
+	# the mkdir/rm names are shadowed by the [DRY] logging overrides).
+	/bin/mkdir -p "$ENCLAVE_DIR"
 
 	# Crash recovery: if a previous run was SIGKILLed while Docker was stopped,
 	# the state file survives in /tmp and the running_containers list survives
@@ -221,9 +228,9 @@ init_state() {
 
 	: >"$STATE_FILE"
 
-	# Reset IPC Queue
-	rm -rf "$IPC_BASE"
-	mkdir -p "$IPC_ERRORS"
+	# Reset IPC Queue (real even in dry-run — see /bin/mkdir note above)
+	/bin/rm -rf "$IPC_BASE"
+	/bin/mkdir -p "$IPC_ERRORS"
 	: >"$SESSION_MANIFEST"
 }
 
@@ -287,6 +294,11 @@ DOCKER_STOP_TIMEOUT=60
 
 # --- Retention & Integrity ---
 ROTATE_DAYS=90                  # Days to keep files (0 = forever)
+ROTATE_UNSTAMPED_GRACE_HOURS=24 # A file with NO dated checksum is exempt from
+                                # mtime-fallback rotation until it has been on
+                                # disk (ctime) at least this long — gives
+                                # watchtower a window to stamp out-of-band
+                                # arrivals whose preserved mtime is old.
 VERIFY_LOCAL_BACKUPS=true       # Hash-verify files CREATED THIS SESSION after produce
 VERIFY_ALL_LOCAL_BACKUPS=false  # Also re-hash the entire BACKUP_BASE tree on every
                                 # run. Redundant with watchtower's scheduled deep
@@ -1131,7 +1143,12 @@ if [[ "${DRY_RUN}" == "true" ]]; then
 	rm() { log "[DRY] rm $*"; }
 	mkdir() { log "[DRY] mkdir $*"; }
 	find() { if [[ "$*" == *"-delete"* || "$*" == *"-exec rm"* ]]; then log "[DRY] find $*"; else /usr/bin/find "$@"; fi; }
-	eval "${DOCKER_CMD}() { log \"[DRY] ${DOCKER_CMD} \$*\"; }"
+	# Stub docker only when a real docker binary exists. When docker is
+	# absent DOCKER_CMD is the no-op "true", and defining a function named
+	# `true` would shadow the shell builtin for the rest of the run.
+	if [[ "$DOCKER_CMD" != "true" ]]; then
+		eval "${DOCKER_CMD}() { log \"[DRY] ${DOCKER_CMD} \$*\"; }"
+	fi
 	mysqldump() { log "[DRY] mysqldump $*"; }
 	pg_dump() { log "[DRY] pg_dump $*"; }
 	losetup() { log "[DRY] losetup $*"; }
@@ -1322,10 +1339,13 @@ create_archive() {
 	local manifest_dir=""
 	manifest_dir=$(mktemp -d /tmp/ab_manifest.XXXXXX 2>/dev/null || echo "")
 	if [[ -n "$manifest_dir" ]]; then
-		mkdir -p "${manifest_dir}/.auto-backupper" 2>/dev/null || true
+		# The manifest tempdir is private scratch under /tmp: create and
+		# remove it for real even in dry-run (where mkdir/rm are shadowed
+		# by the [DRY] logging overrides), so mktemp dirs never leak.
+		/bin/mkdir -p "${manifest_dir}/.auto-backupper" 2>/dev/null || true
 		if ! _write_manifest "${manifest_dir}/.auto-backupper/MANIFEST.txt" \
 			"$(basename "$archive")" "$base" "$@" 2>/dev/null; then
-			rm -rf "$manifest_dir"
+			/bin/rm -rf "$manifest_dir"
 			manifest_dir=""
 		fi
 	fi
@@ -1352,10 +1372,22 @@ create_archive() {
 		tar -S --use-compress-program="$TAR_CMD" "-c${TAR_VERBOSE_FLAG}f" "$archive" \
 			-C "$base" "$@" || tar_rc=$?
 	fi
-	[[ -n "$manifest_dir" ]] && rm -rf "$manifest_dir"
+	[[ -n "$manifest_dir" ]] && /bin/rm -rf "$manifest_dir"
 
 	if [[ $tar_rc -eq 0 ]]; then
-		write_checksum "$archive" "$BACKUP_BASE"
+		# Dry-run stops here: the tar stub produced no file, so there is
+		# nothing to checksum and nothing for the verify phase to hash.
+		if [[ "${DRY_RUN}" == "true" ]]; then
+			log "[DRY] checksum + session-manifest entry for ${archive}"
+			CURRENT_ARCHIVE_FILE=""
+			return 0
+		fi
+		# A failed checksum write leaves a valid archive without its
+		# dated checksum; watchtower stamps it on its next scan. Not a
+		# reason to discard the archive or abort the run.
+		if ! write_checksum "$archive" "$BACKUP_BASE"; then
+			log "WARN: Checksum write failed for ${archive} (watchtower will stamp it on its next scan)"
+		fi
 		# Record this archive in the session manifest so verification only
 		# hashes what we actually produced this run — not the whole backup
 		# tree. The manifest lives under IPC_BASE, so cleanup wipes it on exit.
@@ -1367,6 +1399,18 @@ create_archive() {
 		rm -f "$archive"
 		CURRENT_ARCHIVE_FILE=""
 		return 1
+	fi
+}
+
+# Production-flow wrapper around create_archive. create_archive already
+# logs, notifies and removes the partial file when an archive fails;
+# this wrapper counts the failure and returns success, so one failed
+# archive never aborts the run — the remaining archives, verification
+# and rotation still execute. The failure count is reported by the
+# end-of-produce notification.
+try_archive() {
+	if ! create_archive "$@"; then
+		ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 	fi
 }
 
@@ -1390,7 +1434,7 @@ backup_recursive_folder() {
 		[[ -n "${SHARES_EXCLUDE[$share_name]:-}" ]] && ex_str="${SHARES_EXCLUDE[$share_name]}"
 		if [[ -n "$ex_str" ]]; then eval "ex_arr=($ex_str)"; else ex_arr=(); fi
 
-		create_archive "${dest_dir}/${archive_name}" "$parent_path" "${ex_arr[@]}" "$folder_name"
+		try_archive "${dest_dir}/${archive_name}" "$parent_path" "${ex_arr[@]}" "$folder_name"
 	done < <(find "$parent_path" -mindepth 1 -maxdepth 1 -type d -print0 || true)
 }
 
@@ -1515,22 +1559,40 @@ rotation_phase() {
 
 	local rotate_count=0
 	local mtime_fallback_count=0
+	local grace_skip_count=0
+	local now_epoch
+	now_epoch=$(date +%s)
+	local grace_seconds=$(( ${ROTATE_UNSTAMPED_GRACE_HOURS:-24} * 3600 ))
 	while IFS= read -r -d '' old_file; do
 		local d
 		d="$(rotation_date_for "$old_file" "$BACKUP_BASE")"
 		[[ -z "$d" ]] && continue
 		((10#${d} < 10#${cutoff_date})) || continue
-		rotate_count=$((rotate_count + 1))
 
-		# Track the date source for visibility, but only for files we're
-		# actually going to rotate — saves a glob on every fresh file.
+		# Track the date source for visibility, but only for files past
+		# the cutoff — saves a glob on every fresh file.
 		local has_dated_chk
 		if checksum_find_path "$old_file" "$BACKUP_BASE" >/dev/null 2>&1; then
 			has_dated_chk=true
 		else
 			has_dated_chk=false
+		fi
+
+		# Un-stamped files are aged by mtime, which rsync/scp preserve
+		# from the source — so a file that LANDED here minutes ago can
+		# carry a months-old mtime. Exempt any un-stamped file whose
+		# ctime (local landing time) is inside the grace window, leaving
+		# it for watchtower to stamp with a real discovery date first.
+		if [[ "$has_dated_chk" == "false" ]]; then
+			local ctime_epoch
+			ctime_epoch=$(stat -c %Z "$old_file" 2>/dev/null || echo 0)
+			if (( now_epoch - ctime_epoch < grace_seconds )); then
+				grace_skip_count=$((grace_skip_count + 1))
+				continue
+			fi
 			mtime_fallback_count=$((mtime_fallback_count + 1))
 		fi
+		rotate_count=$((rotate_count + 1))
 
 		if [[ "${DRY_RUN}" == "true" ]]; then
 			log "[DRY-ROTATE] ${old_file#"$BACKUP_BASE"/} (date=${d}, source=$([[ "$has_dated_chk" == "true" ]] && echo suffix || echo mtime))"
@@ -1543,6 +1605,7 @@ rotation_phase() {
 	done < <(find "$BACKUP_BASE" -path "$BACKUP_BASE/${CHECKSUM_DIR}" -prune -o -type f -print0 2>/dev/null)
 
 	[[ $mtime_fallback_count -gt 0 ]] && log "INFO: Rotation used mtime fallback for ${mtime_fallback_count} un-stamped file(s)"
+	[[ $grace_skip_count -gt 0 ]] && log "INFO: Rotation grace: ${grace_skip_count} un-stamped recent file(s) left for watchtower to stamp first"
 
 	if [[ "${DRY_RUN}" == "true" ]]; then
 		log "Rotation [DRY]: ${rotate_count} file(s) would be removed"
@@ -1635,9 +1698,10 @@ produce_flow() {
 					fi
 
 					if "${dump_cmd[@]}" >"$full_dump_path" 2>/dev/null; then
-						create_archive "$final" "$tmp_dir" "$dump_file"
+						try_archive "$final" "$tmp_dir" "$dump_file"
 					else
 						log "ERROR: SQL Dump failed for $db"
+						ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 					fi
 					rm -rf "$tmp_dir"
 				done
@@ -1708,9 +1772,10 @@ EOF
 						local cmd_args=("mongodump" "--config" "$mongo_container_creds" "--archive" "--gzip")
 						[[ "$mdb" != "ALL" ]] && cmd_args+=("--db" "$mdb")
 						if $DOCKER_CMD exec "$MONGO_CONTAINER_NAME" "${cmd_args[@]}" >"$full_dump_path" 2>/dev/null; then
-							create_archive "$final" "$tmp_dir" "$dump_file"
+							try_archive "$final" "$tmp_dir" "$dump_file"
 						else
 							log "ERROR: Mongo dump failed for $mdb"
+							ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 						fi
 						rm -rf "$tmp_dir"
 					done
@@ -1754,9 +1819,10 @@ EOF
 				[[ -n "$REDIS_PASS" ]] && docker_env_args=(-e "REDISCLI_AUTH=$REDIS_PASS")
 
 				if $DOCKER_CMD exec "${docker_env_args[@]}" "$REDIS_CONTAINER_NAME" redis-cli --rdb - >"${tmp_dir}/${dump_file}" 2>/dev/null; then
-					create_archive "$final" "$tmp_dir" "$dump_file"
+					try_archive "$final" "$tmp_dir" "$dump_file"
 				else
 					log "ERROR: Redis dump failed"
+					ARCHIVE_FAILURES=$((ARCHIVE_FAILURES + 1))
 				fi
 				rm -rf "$tmp_dir"
 			else
@@ -1801,7 +1867,7 @@ EOF
 				log "WARN: Docker image file not found: $DOCKER_IMG_PATH"
 			fi
 		fi
-		[[ ${#targets[@]} -gt 0 ]] && create_archive "$sys_path" "/" "${targets[@]}"
+		[[ ${#targets[@]} -gt 0 ]] && try_archive "$sys_path" "/" "${targets[@]}"
 	fi
 
 	if [[ "$need_docker_stop" == "true" ]]; then sys_docker_start; fi
@@ -1831,7 +1897,7 @@ EOF
 							local sub_full_path="${m_path}/${sub}"
 							if [[ -d "$sub_full_path" ]]; then
 								local archive_dest="${BACKUP_BASE}/shares/FamilyBackups/${m_name}/${sub}/${m_name}_${sub}_${CDATE}${TAR_EXT}"
-								create_archive "$archive_dest" "$sub_full_path" "."
+								try_archive "$archive_dest" "$sub_full_path" "."
 							fi
 						done
 					done < <(find "$fam_root" -mindepth 1 -maxdepth 1 -type d -print0 || true)
@@ -1846,7 +1912,7 @@ EOF
 			if [[ -n "$ex_str" ]]; then eval "ex_arr=($ex_str)"; else ex_arr=(); fi
 			local share_clean_name
 			share_clean_name="$(basename "$share")"
-			create_archive "${BACKUP_BASE}/shares/$share/${share_clean_name}_${CDATE}${TAR_EXT}" "$SHARES_BASE_FOLDER" "${ex_arr[@]}" "$share"
+			try_archive "${BACKUP_BASE}/shares/$share/${share_clean_name}_${CDATE}${TAR_EXT}" "$SHARES_BASE_FOLDER" "${ex_arr[@]}" "$share"
 		done
 	fi
 
@@ -1869,7 +1935,7 @@ EOF
 		threads=$(get_thread_count)
 		export CHECKSUM_DIR IPC_ERRORS
 
-		rm -f "${IPC_ERRORS:?}"/*
+		/bin/rm -f "${IPC_ERRORS:?}"/*
 
 		local max_jobs="$threads"
 		local current_jobs=0
@@ -1928,7 +1994,7 @@ EOF
 				done
 				# Clean up so that a subsequent pull_flow's verify starts with an
 				# empty queue even if its own rm -f guard is ever bypassed.
-				rm -f "${IPC_ERRORS:?}"/*
+				/bin/rm -f "${IPC_ERRORS:?}"/*
 			else
 				log "Verification Successful (No IPC Error Exceptions)"
 			fi
@@ -1945,7 +2011,12 @@ EOF
 	else
 		rotation_phase
 	fi
-	send_notify "normal" "Backup Complete" "Local produce finished."
+	if [[ "$ARCHIVE_FAILURES" -gt 0 ]]; then
+		log "WARN: Produce finished with ${ARCHIVE_FAILURES} failed archive(s) — see ERROR lines above."
+		send_notify "warning" "Backup Complete (with failures)" "Local produce finished: ${ARCHIVE_FAILURES} archive(s) failed."
+	else
+		send_notify "normal" "Backup Complete" "Local produce finished."
+	fi
 }
 
 pull_flow() {
@@ -2115,7 +2186,7 @@ pull_flow() {
 			local verify_scope="SESSION ONLY"
 			[[ "${VERIFY_ALL_PULLED_BACKUPS:-false}" == "true" ]] && verify_scope="FULL TREE"
 			log "Verifying Pull [${verify_scope}] (Threads: $threads) [IPC: $IPC_BASE]..."
-			rm -f "${IPC_ERRORS:?}"/*
+			/bin/rm -f "${IPC_ERRORS:?}"/*
 
 			# Build the list of relative folder names that exist locally.
 			# We keep them RELATIVE so the find below can be run from inside
