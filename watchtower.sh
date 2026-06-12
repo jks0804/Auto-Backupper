@@ -75,6 +75,11 @@ STATUS_FILE="/tmp/ab_watchtower.status"
 # State Tracking (Prevents Log Flooding)
 LAST_LOGGED_THREADS="-1"
 
+# PIDs of backgrounded daemon tasks (docker update / recovery pass). The
+# shutdown handler waits on these so a stop signal doesn't orphan an in-flight
+# container recreate. Declared here to stay set -u safe.
+_BG_TASK_PIDS=()
+
 # Log Rotation Defaults
 LOG_MAX_SIZE="$((10 * 1024 * 1024))" # 10MB
 LOG_BACKUPS=5
@@ -128,6 +133,20 @@ RUN_MOVER_DURING_PARITY=false
 
 # Defaults for opt-in cleanup behaviours (see run_cleanup_task)
 CLEANUP_MEDIA_METADATA=false
+
+# Integrity-scan stability check (see file_is_stable). A file is only
+# checksummed/moved once it has been quiet for SCAN_STABLE_MIN_AGE seconds AND
+# its size+mtime are unchanged across SCAN_STABLE_SAMPLES samples taken
+# SCAN_STABLE_INTERVAL seconds apart. Defaults are deliberately conservative so
+# the scan never stamps a checksum over a still-writing archive.
+SCAN_STABLE_SAMPLES=3
+SCAN_STABLE_INTERVAL=2
+SCAN_STABLE_MIN_AGE=15
+
+# Bounded grace period (seconds) the daemon waits on INT/TERM for an in-flight
+# backgrounded task (docker update / recovery pass) to reach a safe point
+# before exiting, so a stop signal can't orphan a container mid-recreate.
+DAEMON_SHUTDOWN_GRACE=30
 
 # PID file written by auto-backupper.sh at startup; used by --stop-backup.
 BACKUP_PIDFILE="/var/run/auto_backupper.pid"
@@ -451,6 +470,32 @@ daemon_signal_handler() {
 	# and the main loop will call check_manual_triggers immediately.
 }
 
+# Graceful daemon shutdown. On INT/TERM, give any in-flight backgrounded task
+# (docker update or recovery pass) a bounded chance to finish its current
+# container operation before we exit, so a stop/reboot signal doesn't orphan a
+# container between `docker rm` and recreate. Bounded by DAEMON_SHUTDOWN_GRACE.
+#
+# Scope note: this protects against a signal sent to the daemon itself
+# (watchtower's own stop, `kill <pid>`, a hub stop). A systemd control-group
+# kill (the default KillMode=control-group) also signals the child tasks
+# directly, which this cannot intercept — use KillMode=mixed in the unit if you
+# schedule updates near array-stop/shutdown windows.
+_daemon_shutdown() {
+	local grace="${DAEMON_SHUTDOWN_GRACE:-30}" p waited
+	[[ "$grace" =~ ^[0-9]+$ ]] || grace=30
+	for p in ${_BG_TASK_PIDS[@]+"${_BG_TASK_PIDS[@]}"}; do
+		kill -0 "$p" 2>/dev/null || continue
+		log "SHUTDOWN: waiting up to ${grace}s for in-flight task (pid $p) to finish..."
+		waited=0
+		while kill -0 "$p" 2>/dev/null && ((waited < grace)); do
+			sleep 1
+			waited=$((waited + 1))
+		done
+		kill -0 "$p" 2>/dev/null && log "SHUTDOWN: task $p still running after ${grace}s; leaving it to finish."
+	done
+	rm -f "$PID_FILE" "$STATUS_FILE" 2>/dev/null || true
+}
+
 rainbow_sleep() {
 	local duration_sec="$1"
 	local status_text="$2"
@@ -551,21 +596,40 @@ monitor_logs() {
 
 file_is_stable() {
 	local file="$1"
-	local size1 size2
+	# The old check compared size only, twice, 1 second apart. A write that
+	# paused for >1s between bytes — a sparse-hole tar -S, a stalled rsync
+	# source, disk contention — read as "stable", so the scan would stamp a
+	# checksum over a still-growing file; every later verify then treats that
+	# premature checksum as authoritative. Harden it two ways:
+	#   1. Minimum quiet age: skip any file touched within the last
+	#      SCAN_STABLE_MIN_AGE seconds (it may still be mid-write).
+	#   2. Multi-sample stability: size AND mtime must be identical across
+	#      SCAN_STABLE_SAMPLES samples taken SCAN_STABLE_INTERVAL apart.
+	# (The worker also holds BACKUP_LOCKFILE while writing, and the scan is
+	# gated off whenever is_backup_running — see the monitor loop and
+	# check_manual_triggers — so this primarily protects against out-of-band
+	# uploads writing directly into WATCH_DIR.)
+	local samples="${SCAN_STABLE_SAMPLES:-3}"
+	local interval="${SCAN_STABLE_INTERVAL:-2}"
+	local min_age="${SCAN_STABLE_MIN_AGE:-15}"
+	[[ "$samples"  =~ ^[0-9]+$ ]] || samples=3
+	[[ "$interval" =~ ^[0-9]+$ ]] || interval=2
+	[[ "$min_age"  =~ ^[0-9]+$ ]] || min_age=15
+	((samples < 2)) && samples=2
 
-	# Check 1 (Max 2 seconds)
-	if ! size1=$(timeout 2s stat -c%s "$file" 2>/dev/null); then
-		return 1
-	fi
+	local now mtime
+	now=$(date +%s)
+	if ! mtime=$(timeout 2s stat -c%Y "$file" 2>/dev/null); then return 1; fi
+	[[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+	((now - mtime < min_age)) && return 1
 
-	sleep 1
-
-	# Check 2 (Max 2 seconds)
-	if ! size2=$(timeout 2s stat -c%s "$file" 2>/dev/null); then
-		return 1
-	fi
-
-	[[ "$size1" != "$size2" ]] && return 1
+	local prev="" sig i
+	for ((i = 0; i < samples; i++)); do
+		if ! sig=$(timeout 2s stat -c'%s:%Y' "$file" 2>/dev/null); then return 1; fi
+		[[ -n "$prev" && "$sig" != "$prev" ]] && return 1
+		prev="$sig"
+		((i < samples - 1)) && sleep "$interval"
+	done
 	return 0
 }
 
@@ -616,18 +680,32 @@ get_cache_usage() {
 		return 1
 	fi
 	usage="$(echo "${df_out}" | awk 'NR==2 {print $5}' | tr -d '%')"
+	# Guard against a non-numeric token (locale-mangled df, a diagnostic line
+	# landing on NR==2, an erroring mount). A non-digit value would otherwise
+	# reach `((usage >= CACHE_CRITICAL))` in manage_cache_state and, under
+	# set -u, abort the entire daemon with an "unbound variable" error.
+	[[ "$usage" =~ ^[0-9]+$ ]] || usage=0
 	echo "${usage:-0}"
 }
 
 trigger_mover() {
 	log "ACTION: Triggering Mover ($MOVER_TYPE)..."
 	if [[ "$MOVER_TYPE" == "internal" ]]; then
-		find "$CACHE_DIR" -type f -not -name ".abpartial" -print0 | while IFS= read -r -d '' src; do
+		# Prune the .abpartial DIRECTORY (rsync's --partial-dir), not merely a
+		# file literally named ".abpartial": it holds in-progress transfer chunks
+		# under their real names, which must never be moved to the array or have
+		# their source removed. `-not -name` failed to prune the directory, so
+		# find descended into it and could move/delete a live partial.
+		# `--update` stops an older cache copy from overwriting a NEWER file
+		# already on the array; rsync then leaves that skipped source in place
+		# (not transferred -> --remove-source-files won't delete it) rather than
+		# clobbering the newer copy and deleting the source.
+		find "$CACHE_DIR" -name ".abpartial" -prune -o -type f -print0 | while IFS= read -r -d '' src; do
 			if file_is_stable "$src"; then
 				local rel="${src#"$CACHE_DIR"/}"
 				local dest="$ARRAY_BASE_PATH/$rel"
 				mkdir -p "$(dirname "$dest")"
-				rsync -a --remove-source-files "$src" "$dest"
+				rsync -a --update --remove-source-files "$src" "$dest"
 			fi
 		done
 		find "$CACHE_DIR" -type d -empty -delete
@@ -648,6 +726,15 @@ manage_cache_state() {
 	usage=$(get_cache_usage)
 	if ((usage >= CACHE_CRITICAL)); then
 		send_notify "alert" "Cache Critical" "Cache is at ${usage}%"
+		# Honour the parity guard even at the critical threshold. Running the
+		# mover concurrently with a parity check/rebuild causes heavy disk-head
+		# contention that slows parity and extends the reduced-redundancy
+		# window. The lower THRESHOLD branch already does this; the critical
+		# branch used to skip it and start the mover mid-parity.
+		if is_parity_running && [[ "${RUN_MOVER_DURING_PARITY:-false}" != "true" ]]; then
+			log "Cache critical (${usage}%) but a parity check is running; deferring mover (set RUN_MOVER_DURING_PARITY=true to override)."
+			return
+		fi
 		if is_backup_running && [[ "${FORCE_MOVER_ON_CRITICAL:-false}" != "true" ]]; then return; fi
 		trigger_mover
 		return
@@ -753,6 +840,7 @@ check_update_scheduler() {
 	is_backup_running && return
 	if [[ "$(should_run_schedule "$UPDATE_SCHEDULER_MODE" "$UPDATE_SCHEDULER_VALUE" "$UPDATE_SCHEDULER_TIME" "$LAST_RUN_UPDATE")" == "true" ]]; then
 		run_docker_update_task &
+		_BG_TASK_PIDS+=($!)   # tracked so the shutdown handler can wait on it
 		atomic_write "$LAST_RUN_UPDATE" "$(date +%Y%m%d)"
 	fi
 }
@@ -850,6 +938,26 @@ _recovery_build_run_args() {
 	[[ -n "$cpuset" ]] && _REC_RUN_ARGS+=(--cpuset-cpus "$cpuset")
 	[[ -n "$mem" && "$mem" != "0" ]] && _REC_RUN_ARGS+=(--memory "$mem")
 
+	# --user: a container created with a non-default UID must keep it, or the
+	# recreated one writes files as the image-default user.
+	local user
+	user=$(docker inspect -f '{{.Config.User}}' "$name")
+	[[ -n "$user" ]] && _REC_RUN_ARGS+=(--user "$user")
+
+	# --entrypoint: docker run takes a single entrypoint string. Reconstruct the
+	# common single-element case faithfully; for a multi-element entrypoint, run
+	# flags can't express the extra elements, so emit the first and warn rather
+	# than silently producing a container that runs the image-default entrypoint.
+	local -a ep=()
+	while IFS= read -r line; do ep+=("$line"); done \
+		< <(docker inspect -f '{{range .Config.Entrypoint}}{{println .}}{{end}}' "$name")
+	if ((${#ep[@]} == 1)); then
+		_REC_RUN_ARGS+=(--entrypoint "${ep[0]}")
+	elif ((${#ep[@]} > 1)); then
+		_REC_RUN_ARGS+=(--entrypoint "${ep[0]}")
+		log "WARN: RECOVERY — $name has a multi-element entrypoint; only the first element ('${ep[0]}') is reconstructed. Verify the recreated container."
+	fi
+
 	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(-v "$line"); done \
 		< <(docker inspect -f '{{range .HostConfig.Binds}}{{println .}}{{end}}' "$name")
 	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(-e "$line"); done \
@@ -864,6 +972,30 @@ _recovery_build_run_args() {
 		< <(docker inspect -f '{{range .HostConfig.CapDrop}}{{println .}}{{end}}' "$name")
 	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--add-host "$line"); done \
 		< <(docker inspect -f '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' "$name")
+
+	# Additional HostConfig fields commonly set on hand-crafted containers. All
+	# optional/additive — a flag is emitted only when the field is non-empty.
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--group-add "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--security-opt "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--dns "$line"); done \
+		< <(docker inspect -f '{{range .HostConfig.Dns}}{{println .}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--tmpfs "$line"); done \
+		< <(docker inspect -f '{{range $p,$o := .HostConfig.Tmpfs}}{{if $o}}{{printf "%s:%s\n" $p $o}}{{else}}{{println $p}}{{end}}{{end}}' "$name")
+	while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--sysctl "$line"); done \
+		< <(docker inspect -f '{{range $k,$v := .HostConfig.Sysctls}}{{printf "%s=%s\n" $k $v}}{{end}}' "$name")
+
+	# --log-driver / --log-opt: only when a non-default driver is set (emitting
+	# the json-file default with no opts would be redundant noise and could
+	# override a differently-configured daemon default).
+	local logdriver
+	logdriver=$(docker inspect -f '{{.HostConfig.LogConfig.Type}}' "$name")
+	if [[ -n "$logdriver" && "$logdriver" != "json-file" ]]; then
+		_REC_RUN_ARGS+=(--log-driver "$logdriver")
+		while IFS= read -r line; do [[ -n "$line" ]] && _REC_RUN_ARGS+=(--log-opt "$line"); done \
+			< <(docker inspect -f '{{range $k,$v := .HostConfig.LogConfig.Config}}{{printf "%s=%s\n" $k $v}}{{end}}' "$name")
+	fi
 
 	# Port publishes (not valid with host networking).
 	if [[ "$netmode" != "host" ]]; then
@@ -1057,19 +1189,44 @@ _recovery_one() {
 		return 0
 	fi
 
-	if ! docker rm "$name" >/dev/null 2>&1; then docker rm -f "$name" >/dev/null 2>&1; fi
+	# Rename the existing (ghost) container aside as a rollback point instead of
+	# deleting it outright. Previously we `docker rm`'d before recreating, so a
+	# failed recreate (torn/partial recipe, missing image, port clash) left the
+	# container GONE with no way back. With rename-aside, a failed recreate is
+	# rolled back to the original ghost — never worse than "present but broken".
+	# A container with no record at all (orphan-image case) has nothing to
+	# rename, so we recreate directly.
+	local backup_name=""
 	if docker inspect "$name" >/dev/null 2>&1; then
-		log "ERROR: RECOVERY — could not remove $name; skipping. Try manually: docker rm -f $name"
-		_REC_N_ERROR+=1
-		return 1
+		backup_name="${name}.ab-recovery-bak"
+		docker rm -f "$backup_name" >/dev/null 2>&1 || true   # clear any stale backup
+		if ! docker rename "$name" "$backup_name" >/dev/null 2>&1; then
+			# Rename unavailable — fall back to the old remove path so the name frees.
+			backup_name=""
+			if ! docker rm "$name" >/dev/null 2>&1; then docker rm -f "$name" >/dev/null 2>&1; fi
+			if docker inspect "$name" >/dev/null 2>&1; then
+				log "ERROR: RECOVERY — could not rename or remove $name; skipping. Try manually: docker rm -f $name"
+				_REC_N_ERROR+=1
+				return 1
+			fi
+		fi
 	fi
 
 	if newid=$(docker "${_REC_RUN_ARGS[@]}" 2>&1); then
 		log "RECOVERY: recovered (recreate): $name -> ${newid:0:12}"
+		# Success — discard the saved-aside original.
+		[[ -n "$backup_name" ]] && docker rm -f "$backup_name" >/dev/null 2>&1 || true
 		_REC_N_RECREATE+=1
 		return 0
 	else
 		log "ERROR: RECOVERY — recreate failed for $name: $newid"
+		if [[ -n "$backup_name" ]]; then
+			if docker rename "$backup_name" "$name" >/dev/null 2>&1; then
+				log "RECOVERY: recreate failed; restored the original $name (still a ghost — needs manual repair)."
+			else
+				log "ERROR: RECOVERY — recreate AND rollback failed for $name; the original is preserved as '$backup_name'."
+			fi
+		fi
 		_REC_N_ERROR+=1
 		return 1
 	fi
@@ -1144,8 +1301,25 @@ _recovery_is_candidate() {
 		_REC_CANDIDATE_REASON="ghost-state"; return 0
 	fi
 	# Orphaned/leftover-image trigger (missing container + image still present).
-	if [[ "${DOCKER_RECOVERY_USE_ORPHAN_IMAGES:-true}" == "true" && "$state" == "__none__" ]] && _recovery_image_present "$name"; then
-		_REC_CANDIDATE_REASON="orphan-image"; return 0
+	# A missing container is only treated as a recoverable orphan when we have
+	# POSITIVE evidence it was supposed to be running — otherwise we'd resurrect
+	# an app the user deliberately removed (GUI "Remove Container" leaves the
+	# template + image behind, i.e. exactly state=__none__ + image present).
+	#
+	# In autostart mode with a readable list this branch is intentionally inert:
+	# an autostart-ON missing container is already caught above (reason=autostart),
+	# and an autostart-OFF one is, by definition, not supposed to be running. So
+	# orphan-image only fires in the fallback paths (states mode, or the autostart
+	# list couldn't be read), and even then only when a saved recovery recipe
+	# exists — proof the daemon managed this container while it was healthy.
+	if [[ "${DOCKER_RECOVERY_USE_ORPHAN_IMAGES:-true}" == "true" && "$state" == "__none__" ]]; then
+		local autostart_authoritative=0
+		[[ "${DOCKER_RECOVERY_DETECT:-autostart}" == "autostart" && "$_REC_AUTOSTART_AVAILABLE" == "1" ]] && autostart_authoritative=1
+		if ((autostart_authoritative == 0)) \
+			&& [[ -f "$DOCKER_RECOVERY_DIR/${name}.args" ]] \
+			&& _recovery_image_present "$name"; then
+			_REC_CANDIDATE_REASON="orphan-image"; return 0
+		fi
 	fi
 	return 1
 }
@@ -1279,6 +1453,7 @@ check_recovery_interval() {
 		# Mark the epoch up front (before the &) so a long pass can't re-fire.
 		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$now"
 		run_docker_recovery_task &
+		_BG_TASK_PIDS+=($!)   # tracked so the shutdown handler can wait on it
 	fi
 }
 
@@ -1410,20 +1585,34 @@ check_manual_triggers() {
 	fi
 
 	# --- 2. Full Verify ---
+	# Defer (don't consume the trigger) while a backup is running: perform_scan
+	# would otherwise walk the live, in-progress backup tree and could checksum a
+	# half-written archive. The scheduler paths already gate on is_backup_running;
+	# the manual triggers used to bypass that. Leaving the trigger in place means
+	# it fires automatically on the next cycle once the backup releases its lock
+	# (the monitor loop already logs the paused/resumed transition, so no spam).
 	if [[ -f "$TRIGGER_VERIFY" ]]; then
-		log "MANUAL: Trigger received for Full Verification."
-		rm -f "$TRIGGER_VERIFY"
-		send_notify "warning" "Manual Verify" "Starting deep scan..."
-		perform_scan "$WATCH_DIR" "true"
-		send_notify "normal" "Manual Verify" "Scan complete."
+		if is_backup_running; then
+			: # deferred until the backup finishes
+		else
+			log "MANUAL: Trigger received for Full Verification."
+			rm -f "$TRIGGER_VERIFY"
+			send_notify "warning" "Manual Verify" "Starting deep scan..."
+			perform_scan "$WATCH_DIR" "true"
+			send_notify "normal" "Manual Verify" "Scan complete."
+		fi
 	fi
 
 	# --- 3. Quick Scan ---
 	if [[ -f "$TRIGGER_SCAN" ]]; then
-		log "MANUAL: Trigger received for Quick Scan."
-		rm -f "$TRIGGER_SCAN"
-		perform_scan "$WATCH_DIR" "false"
-		log "MANUAL: Quick Scan Complete."
+		if is_backup_running; then
+			: # deferred until the backup finishes (see Full Verify note above)
+		else
+			log "MANUAL: Trigger received for Quick Scan."
+			rm -f "$TRIGGER_SCAN"
+			perform_scan "$WATCH_DIR" "false"
+			log "MANUAL: Quick Scan Complete."
+		fi
 	fi
 
 	# --- 4. Config Reload ---
@@ -3466,7 +3655,11 @@ fi
 if [[ "$MODE" == "--monitor" ]]; then
 	echo $$ >"$PID_FILE"
 	trap 'daemon_signal_handler' SIGUSR1
-	trap 'rm -f "$PID_FILE" "$STATUS_FILE" 2>/dev/null; exit' INT TERM EXIT
+	# INT/TERM: graceful shutdown — wait (bounded) for an in-flight update/recovery
+	# task so a stop signal can't orphan a container mid-recreate, then exit (which
+	# fires the EXIT trap). EXIT alone handles PID/STATUS cleanup for any other path.
+	trap '_daemon_shutdown; exit' INT TERM
+	trap 'rm -f "$PID_FILE" "$STATUS_FILE" 2>/dev/null' EXIT
 	set_status "Idle"
 fi
 
