@@ -542,6 +542,15 @@ def docker_unraid_unmount():
         subprocess.run(["losetup", "-d", loop], stderr=subprocess.DEVNULL)
 
 
+def _cfg_int(key, default):
+    # Coerce a config value to int, falling back to `default` on a non-numeric
+    # value (a unit suffix like "60s" or a typo) instead of raising mid-run.
+    try:
+        return int(str(CONFIG[key]).strip())
+    except (KeyError, ValueError, TypeError):
+        return default
+
+
 def sys_docker_stop():
     mode = CONFIG["DOCKER_MODE"]
     if mode == "unraid_service":
@@ -549,10 +558,16 @@ def sys_docker_stop():
             log("[DRY] Stop Unraid Docker Svc")
             set_state("DOCKER_STOPPED", "true")
             return
+        # Parse the timeout defensively and record DOCKER_STOPPED BEFORE issuing
+        # the stop: a crash between `rc.docker stop` and a later set_state (e.g.
+        # a non-integer DOCKER_STOP_TIMEOUT) would otherwise leave Docker down
+        # with the emergency-restart guard (which keys on DOCKER_STOPPED) never
+        # firing — stranding every container.
+        timeout = _cfg_int("DOCKER_STOP_TIMEOUT", 60)
         log("ACTION: Stopping Unraid Docker Service...")
+        set_state("DOCKER_STOPPED", "true")
         subprocess.run(["/etc/rc.d/rc.docker", "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Poll status until down, up to DOCKER_STOP_TIMEOUT, then force.
-        timeout = int(CONFIG["DOCKER_STOP_TIMEOUT"])
         elapsed = 0
         while True:
             st = subprocess.run(["/etc/rc.d/rc.docker", "status"], capture_output=True, text=True).stdout
@@ -565,7 +580,7 @@ def sys_docker_stop():
                 subprocess.run(["/etc/rc.d/rc.docker", "force_stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 break
         docker_unraid_unmount()
-        set_state("DOCKER_STOPPED", "true")
+        # DOCKER_STOPPED already set above (before the stop) for crash-safety.
     elif mode == "container":
         if not DOCKER_CMD:
             return
@@ -581,7 +596,7 @@ def sys_docker_stop():
             return
         log("ACTION: Stopping running containers...")
         for c in containers:
-            if subprocess.run([DOCKER_CMD, "stop", "-t", CONFIG["DOCKER_STOP_TIMEOUT"], c],
+            if subprocess.run([DOCKER_CMD, "stop", "-t", str(_cfg_int("DOCKER_STOP_TIMEOUT", 60)), c],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
                 subprocess.run([DOCKER_CMD, "kill", c], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -1362,7 +1377,13 @@ def _verify_local():
 
 def _verify_many(files, base, threads):
     failed = []
-    with ThreadPoolExecutor(max_workers=threads) as ex:
+    # Explicit executor + shutdown(wait=False): the `with ... as ex` form runs
+    # shutdown(wait=True) on block exit, which blocks on a worker wedged in an
+    # unbounded os.stat/open even after its 900s fut.result timeout fired —
+    # defeating the timeout and hanging the run before rotation. Don't wait on a
+    # hung worker; record it as failed and let the run proceed.
+    ex = ThreadPoolExecutor(max_workers=threads)
+    try:
         futures = {ex.submit(verify_file, f, base): f for f in files}
         for fut in futures:
             f = futures[fut]
@@ -1376,6 +1397,8 @@ def _verify_many(files, base, threads):
                 failed.append(f)
             except Exception:
                 failed.append(f)
+    finally:
+        ex.shutdown(wait=False)
     return failed
 
 
@@ -1536,7 +1559,11 @@ def _verify_pull(folders, base, active, threads, marker_ctime):
         return
 
     failed = []
-    with ThreadPoolExecutor(max_workers=threads) as ex:
+    # Explicit executor + shutdown(wait=False) — see _verify_many: the `with`
+    # form would block on a wedged worker at block exit even after the per-file
+    # timeout, hanging the run; don't wait on a hung worker.
+    ex = ThreadPoolExecutor(max_workers=threads)
+    try:
         futures = {ex.submit(verify_file, os.path.join(base, rel), base): rel for rel in rel_files}
         for fut in futures:
             rel = futures[fut]
@@ -1549,6 +1576,8 @@ def _verify_pull(folders, base, active, threads, marker_ctime):
                 failed.append(rel)
             except Exception:
                 failed.append(rel)
+    finally:
+        ex.shutdown(wait=False)
 
     if not failed:
         log("Pull Verification Successful.")
