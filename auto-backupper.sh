@@ -2364,9 +2364,15 @@ main() {
 	# Atomic write: torn writes would leave the file empty and watchtower's
 	# should_run_schedule would either re-fire the backup or fail to parse.
 	{
-		_lr_tmp="/tmp/auto_backupper_last_run_backup.tmp.$$"
+		# Persist under the backup tree's .checksums/ (every find walk in the
+		# suite prunes it) so the marker survives a reboot — on Unraid /tmp is
+		# tmpfs. Must match watchtower's AB_STATE_DIR so its scheduler reads the
+		# same stamp; the /tmp fallback filename matches on both sides too.
+		_lr_state_dir="${BACKUP_BASE}/${CHECKSUM_DIR}/.watchtower_state"
+		mkdir -p "$_lr_state_dir" 2>/dev/null || _lr_state_dir="/tmp"
+		_lr_tmp="${_lr_state_dir}/last_run_backup.tmp.$$"
 		date +%Y%m%d >"$_lr_tmp" 2>/dev/null \
-			&& mv -f "$_lr_tmp" "/tmp/auto_backupper_last_run_backup" 2>/dev/null \
+			&& mv -f "$_lr_tmp" "${_lr_state_dir}/last_run_backup" 2>/dev/null \
 			|| rm -f "$_lr_tmp" 2>/dev/null
 	} || true
 	log "Job Finished."

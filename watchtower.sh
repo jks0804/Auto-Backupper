@@ -193,14 +193,23 @@ fi
 # Derived Variables
 CORRUPTION_REPORT="${WATCH_DIR}/${CHECKSUM_DIR}/${HOSTNAME_VAR}_corruption_report.txt"
 LOGFILE="$WATCHTOWER_LOGFILE"
-LAST_RUN_BACKUP="/tmp/auto_backupper_last_run_backup"
-LAST_RUN_CLEANUP="/tmp/auto_backupper_last_run_cleanup"
-LAST_RUN_VERIFY="/tmp/auto_backupper_last_run_verify"
-LAST_RUN_UPDATE="/tmp/auto_backupper_last_run_update"
-LAST_RUN_RECOVERY="/tmp/auto_backupper_last_run_recovery"
+# Scheduler "last run" markers. These must survive a reboot: on Unraid /tmp
+# (and /var) are tmpfs wiped on boot, so a job that already ran would re-fire
+# after a same-day reboot if its marker lived in /tmp. Anchor them under the
+# backup tree's .checksums/ — which every find walk in the suite already
+# prunes — and fall back to /tmp only if that directory cannot be created.
+# auto-backupper.sh stamps last_run_backup at the SAME path on completion, so
+# the two must agree (they do whenever WATCH_DIR == BACKUP_BASE, the norm).
+AB_STATE_DIR="${WATCH_DIR}/${CHECKSUM_DIR}/.watchtower_state"
+mkdir -p "$AB_STATE_DIR" 2>/dev/null || AB_STATE_DIR="/tmp"
+LAST_RUN_BACKUP="$AB_STATE_DIR/last_run_backup"
+LAST_RUN_CLEANUP="$AB_STATE_DIR/last_run_cleanup"
+LAST_RUN_VERIFY="$AB_STATE_DIR/last_run_verify"
+LAST_RUN_UPDATE="$AB_STATE_DIR/last_run_update"
+LAST_RUN_RECOVERY="$AB_STATE_DIR/last_run_recovery"
 # Sub-day interval gate for periodic recovery passes (epoch seconds; the
 # YYYYMMDD LAST_RUN_RECOVERY above is only for the --status age display).
-RECOVERY_LAST_PASS_EPOCH="/tmp/ab_watchtower_recovery_epoch"
+RECOVERY_LAST_PASS_EPOCH="$AB_STATE_DIR/recovery_epoch"
 
 # ==============================================================================
 # 2. CORE TOOLS
@@ -566,7 +575,7 @@ monitor_logs() {
 	local tail_pid=""
 	local current_target=""
 
-	trap '[[ -n "$tail_pid" ]] && kill "$tail_pid" 2>/dev/null; echo; log "LOGS: Monitor exited."; exit 0' INT TERM EXIT
+	trap 'printf "\033[?25h"; [[ -n "$tail_pid" ]] && kill "$tail_pid" 2>/dev/null; echo; log "LOGS: Monitor exited."; exit 0' INT TERM EXIT
 
 	echo "=============================================================================="
 	echo " WATCHTOWER LIVE LOG MONITOR"
@@ -1557,10 +1566,11 @@ should_run_schedule() {
 	local current_hm target_hm
 	current_hm=$(date +%H%M)
 	target_hm=$(echo "$time_target" | tr -d ':')
-	current_hm="${current_hm#0}"
-	target_hm="${target_hm#0}"
-
-	[[ "$current_hm" -lt "$target_hm" ]] && echo "false" && return
+	# Force base-10: stripping a single leading zero leaves "0MM" for the
+	# 00:xx hour, and 08/09 are invalid octal digits in arithmetic context, so
+	# `-lt` would error and fall through (firing the schedule early). Compare
+	# the raw HHMM values with an explicit 10# radix instead.
+	if (( 10#${current_hm:-0} < 10#${target_hm:-0} )); then echo "false"; return; fi
 
 	# S6: Overdue recovery. If the daemon was down through the scheduled window
 	# (e.g. host rebooted across a 02:00 weekly Saturday schedule and came up
@@ -1600,10 +1610,38 @@ should_run_schedule() {
 	local current_day_clean="${current_day#0}"
 	local value_clean="${value#0}"
 
+	# Clamp a 29/30/31 day target to this month's real last day so an
+	# end-of-month schedule still fires in Feb/Apr/Jun/Sep/Nov instead of being
+	# skipped and then overdue-firing on the wrong day the following month.
+	local last_dom eff_day
+	last_dom=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%d 2>/dev/null)
+	last_dom="${last_dom#0}"
+	eff_day="$value_clean"
+	if [[ "$eff_day" =~ ^[0-9]+$ && "$last_dom" =~ ^[0-9]+$ ]] && (( eff_day > last_dom )); then
+		eff_day="$last_dom"
+	fi
+
 	case "$mode" in
-	"annually") if [[ "$current_mon" == "01" && "$current_day_clean" == "$value_clean" ]]; then trigger="true"; fi ;;
-	"quarterly") if [[ "$current_mon" =~ ^(01|04|07|10)$ && "$current_day_clean" == "$value_clean" ]]; then trigger="true"; fi ;;
-	"monthly") if [[ "$current_day_clean" == "$value_clean" ]]; then trigger="true"; fi ;;
+	"annually")
+		# VALUE is "DD" (January, legacy form) or "MM/DD" / "MM-DD" to choose
+		# the month; the day is clamped to that month's real last day.
+		local a_mon a_day a_last
+		if [[ "$value" == *[/-]* ]]; then
+			a_mon="${value%%[/-]*}"
+			a_day="${value##*[/-]}"
+		else
+			a_mon="01"
+			a_day="$value"
+		fi
+		[[ "$a_mon" =~ ^[0-9]+$ ]] && printf -v a_mon '%02d' "$((10#$a_mon))"
+		a_day="${a_day#0}"
+		a_last=$(date -d "$(date +%Y)-${a_mon}-01 +1 month -1 day" +%d 2>/dev/null)
+		a_last="${a_last#0}"
+		if [[ "$a_day" =~ ^[0-9]+$ && "$a_last" =~ ^[0-9]+$ ]] && (( a_day > a_last )); then a_day="$a_last"; fi
+		if [[ "$current_mon" == "$a_mon" && "$current_day_clean" == "$a_day" ]]; then trigger="true"; fi
+		;;
+	"quarterly") if [[ "$current_mon" =~ ^(01|04|07|10)$ && "$current_day_clean" == "$eff_day" ]]; then trigger="true"; fi ;;
+	"monthly") if [[ "$current_day_clean" == "$eff_day" ]]; then trigger="true"; fi ;;
 	"weekly")
 		local dow
 		dow=$(date +%a)
@@ -2694,6 +2732,10 @@ cmd_ab_graph() {
 		detection=$(_ab_graph_detect_worker)
 		worker=$(awk '{print $1}' <<<"$detection")
 		if [[ "$worker" == "idle" ]]; then
+			# Disarm the EXIT trap first: it also runs _ab_graph_restore (which
+			# clears the screen) and would wipe the snapshot printed below when
+			# this function returns and the dispatcher exits.
+			trap - EXIT
 			_ab_graph_restore
 			echo ""
 			echo "Worker exited; --ab-graph stopping. Final snapshot:"
@@ -3004,7 +3046,7 @@ cmd_ab_graph() {
 		local used_h total_h
 		used_h=$(_ab_graph_human_bytes "$df_used")
 		total_h=$(_ab_graph_human_bytes "$df_total")
-		_emit "DEST: ${BACKUP_BASE} — ${df_pct}% (${used_h} / ${total_h})"
+		_emit "DEST: ${BACKUP_BASE:-/} — ${df_pct}% (${used_h} / ${total_h})"
 		_emit "  ${bar}"
 		_emit ""
 
@@ -3021,12 +3063,19 @@ cmd_ab_graph() {
 		# Clear any old rows below where we just rendered.
 		tput ed 2>/dev/null || true
 
-		# Block for refresh seconds OR until user keypress.
+		# Block for refresh seconds OR until user keypress. `read -t` only
+		# blocks on a real terminal; with stdin not a TTY (a pipe, redirect, or
+		# </dev/null) it returns instantly, which would busy-spin this loop at
+		# full CPU — so pace with a plain sleep when stdin isn't interactive.
 		local key
-		if read -r -t "$refresh" -n 1 -s key; then
-			if [[ "$key" == "q" || "$key" == "Q" ]]; then
-				break
+		if [[ -t 0 ]]; then
+			if read -r -t "$refresh" -n 1 -s key; then
+				if [[ "$key" == "q" || "$key" == "Q" ]]; then
+					break
+				fi
 			fi
+		else
+			sleep "$refresh"
 		fi
 	done
 
@@ -3154,13 +3203,18 @@ _hub_confirm() {
 _hub_prompt() {
 	local lines
 	lines=$(tput lines 2>/dev/null || echo 24)
-	tput cup $((lines - 2)) 0 2>/dev/null
-	tput el 2>/dev/null
+	# Every tput here must reach the terminal (fd2), not stdout: this function
+	# returns the typed value via `$(_hub_prompt ...)`, so escape bytes on
+	# stdout would corrupt the captured path and defeat the empty-input cancel
+	# check. Order `>&2 2>/dev/null` keeps fd1 on the terminal (a copy of fd2
+	# taken before fd2 is silenced) while still suppressing tput's own errors.
+	tput cup $((lines - 2)) 0 >&2 2>/dev/null
+	tput el >&2 2>/dev/null
 	printf "  %s: " "$1" >&2
-	tput cnorm 2>/dev/null
+	tput cnorm >&2 2>/dev/null
 	local input=""
 	read -r input
-	tput civis 2>/dev/null
+	tput civis >&2 2>/dev/null
 	printf '%s' "$input"
 }
 
@@ -3222,14 +3276,20 @@ _hub_daemon_stop_inner() {
 		return 1
 	fi
 	kill -TERM "$pid" 2>/dev/null || true
+	# Wait at least as long as the daemon's own graceful-shutdown grace before
+	# escalating to SIGKILL. A hardcoded 5s would SIGKILL it mid docker
+	# update/recovery, orphaning a container the 30s grace exists to protect.
+	local _grace="${DAEMON_SHUTDOWN_GRACE:-30}"
+	[[ "$_grace" =~ ^[0-9]+$ ]] || _grace=30
+	local _budget=$((_grace + 5))
 	local waited=0
-	while kill -0 "$pid" 2>/dev/null && ((waited < 5)); do
+	while kill -0 "$pid" 2>/dev/null && ((waited < _budget)); do
 		sleep 1
 		waited=$((waited + 1))
 	done
 	if kill -0 "$pid" 2>/dev/null; then
 		kill -KILL "$pid" 2>/dev/null || true
-		_hub_notice "Daemon SIGKILLed (didn't exit cleanly after 5s)."
+		_hub_notice "Daemon SIGKILLed (didn't exit cleanly after ${_budget}s)."
 	else
 		_hub_notice "Daemon stopped (PID $pid)."
 	fi
