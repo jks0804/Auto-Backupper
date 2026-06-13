@@ -31,17 +31,22 @@
 set -Eeuo pipefail
 
 # --- Configuration ---
-TARGET_DIR="${1:-/mnt/user/archive}"
 CHECKSUM_DIR=".checksums"
 LOCKFILE="/var/lock/auto_backupper.lock"
 FORCE_REGEN=false
 
 # --- Argument Parsing ---
+# Separate the optional --force flag from the optional path positional so the
+# two may appear in any order; the first non-flag argument is the path.
+TARGET_DIR=""
 for arg in "$@"; do
   if [[ "$arg" == "--force" ]]; then
     FORCE_REGEN=true
+  elif [[ -z "$TARGET_DIR" ]]; then
+    TARGET_DIR="$arg"
   fi
 done
+TARGET_DIR="${TARGET_DIR:-/mnt/user/archive}"
 
 # --- Root Check ---
 if [[ $EUID -ne 0 ]]; then
@@ -347,7 +352,7 @@ echo "Scanning $TARGET_DIR for legacy archives..."
 # Scan for all supported archive types used in your main script
 find "$TARGET_DIR" \
   -type d -name "${CHECKSUM_DIR}" -prune -o \
-  -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.sql.gz" -o -name "*.archive.gz" -o -name "*.json" -o -name "*.zip" -o -name "*.7z" -o -name "*.*" \) \
+  -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.sql.gz" -o -name "*.archive.gz" -o -name "*.json" -o -name "*.zip" -o -name "*.7z" \) \
   ! -name "*.sha256" ! -name "*.sha256.tmp.*" ! -name "*_corruption_report.txt" \
   ! -name "*.part" ! -name "*.partial" ! -name "*.tmp" ! -name "*.tmp.*" \
   -print0 | while IFS= read -r -d '' file; do
