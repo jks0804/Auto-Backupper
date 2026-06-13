@@ -1716,10 +1716,20 @@ check_manual_triggers() {
 		# a malformed cfg logs an error instead of injecting a partial/garbled state.
 		if [[ -f "$CFG_TO_LOAD" ]]; then
 			if bash -n "$CFG_TO_LOAD" 2>/dev/null; then
+				# Source with set -u TEMPORARILY DISABLED. bash -n above catches
+				# only syntax errors; a syntactically-valid cfg that references an
+				# unset variable would, under the daemon's set -u, abort this very
+				# shell (check_manual_triggers runs inline in the monitor loop, no
+				# errexit/ERR net) and silently kill a long-running daemon on a
+				# routine --reload. set +u around the source contains that fault;
+				# the re-derive below also runs in the window since it reads
+				# config-supplied vars. set -u is restored immediately after.
+				set +u
 				# shellcheck disable=SC1090
 				source "$CFG_TO_LOAD"
 				# Re-derive config-dependent vars so they track the reloaded values.
 				CORRUPTION_REPORT="${WATCH_DIR}/${CHECKSUM_DIR}/${HOSTNAME_VAR}_corruption_report.txt"
+				set -u
 				log "CONFIG: Reloaded $CFG_TO_LOAD (note: a changed WATCHTOWER_LOGFILE needs a daemon restart — the log FD is fixed for the daemon's life)."
 			else
 				log "ERROR: $CFG_TO_LOAD has a syntax error (bash -n failed); NOT reloading. Keeping current config."
@@ -3688,10 +3698,14 @@ notify_daemon() {
 case "$MODE" in
 "--reload")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		if [[ -n "$CLI_CONFIG" ]]; then
-			echo "$CLI_CONFIG" >"$TRIGGER_CONFIG"
-			echo "Queued config change to: $CLI_CONFIG"
-		fi
+		# Always queue a config path so the daemon's re-source fires — even for a
+		# bare `--reload` (the documented form). Writing only on --config meant a
+		# bare reload sent SIGUSR1 (which just interrupts the sleep, it does NOT
+		# process triggers) and the file-gated re-source block never ran, so bare
+		# --reload stayed a no-op. Default to the daemon's own active config path
+		# (mirrors the hub's reload). The daemon re-reads the LIVE file contents.
+		echo "${CLI_CONFIG:-$CFG_TO_LOAD}" >"$TRIGGER_CONFIG"
+		echo "Queued config reload: ${CLI_CONFIG:-$CFG_TO_LOAD}"
 		notify_daemon "RELOAD"
 		exit 0
 	else
