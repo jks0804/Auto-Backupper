@@ -80,11 +80,14 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   echo "CRITICAL: Target directory does not exist: $TARGET_DIR"
   exit 1
 fi
-# Strip any trailing slash (tab-completion adds one). Without this, the
-# get_chk_dir prefix-strip sees a double slash, fails to strip, and writes
-# every checksum under the full absolute path — orphaning it from the suite's
-# verify/retention, which then silently never finds it.
-TARGET_DIR="${TARGET_DIR%/}"
+# Strip ALL trailing slashes (tab-completion adds one; a double slash defeats a
+# single-strip). Without this, the get_chk_dir prefix-strip sees a leftover
+# slash, fails to strip, and writes every checksum under the full absolute path
+# — orphaning it from the suite's verify/retention, which then silently never
+# finds it. Guard the root so `/` doesn't collapse to "" (which would make
+# `find ""` abort the whole run under set -e).
+while [[ "$TARGET_DIR" == */ ]]; do TARGET_DIR="${TARGET_DIR%/}"; done
+[[ -z "$TARGET_DIR" ]] && TARGET_DIR="/"
 
 get_chk_dir() {
   # $1 = Full File Path, $2 = Base Directory → echo checksum subdir
@@ -121,9 +124,15 @@ _valid_date() {
 # that is a VALID calendar date (so a trailing serial can't beat the real
 # leading date, and a non-date run is ignored). Empty if none is valid.
 _embedded_date() {
-  local name="$1" g best=""
-  for g in $(echo "$name" | grep -oE '_[0-9]{8}' | sed 's/^_//' || true); do
-    if _valid_date "$g"; then best="$g"; fi
+  local name="$1" tok best=""
+  # Tokenise on non-digit runs (tr replaces every non-digit with a space) and
+  # consider only tokens that are EXACTLY 8 digits. This rejects a 9+-digit run
+  # (serial/version/timestamp) whose leading 8 happen to look like a date —
+  # `grep -oE '_[0-9]{8}'` would have matched that prefix. Keep the LAST valid
+  # calendar date (suite convention: terminal _<CDATE> before the extension).
+  for tok in $(echo "$name" | tr -c '0-9' ' '); do
+    [[ "$tok" =~ ^[0-9]{8}$ ]] || continue
+    if _valid_date "$tok"; then best="$tok"; fi
   done
   printf '%s' "$best"
 }
@@ -285,11 +294,24 @@ generate_checksum() {
       # digest (128 hex), a prose line, or a 64-hex filename token would be
       # PROMOTED as a sha256 that can never match -> permanent false-corruption.
       if [[ -s "$legacy_source" ]] && grep -qE '^[a-fA-F0-9]{64}([[:space:]]|$)' "$legacy_source"; then
-        if mv -f "$legacy_source" "$chk_path"; then
+        # Promote by extracting the bare 64-hex digest and writing it in the
+        # normalized form the suite expects. We must NOT rename a standard
+        # `<hash>  <filename>` sha256sum file verbatim: auto-backupper's
+        # verify_file does `tr -d ' \t\r\n'` over the WHOLE file, so the trailing
+        # filename would fuse onto the hash and never match (false-corruption).
+        # Extracting the first field preserves the HISTORICAL hash value (no
+        # recompute -> bit-rot still caught) while matching write_checksum's
+        # on-disk format (which uses `awk '{print $1}'`).
+        local _legacy_hash
+        _legacy_hash="$(grep -oE '^[a-fA-F0-9]{64}' "$legacy_source" | head -1 || true)"
+        local _ptmp="${chk_path}.tmp.$$"
+        if [[ -n "$_legacy_hash" ]] && printf '%s\n' "$_legacy_hash" >"$_ptmp" && mv -f "$_ptmp" "$chk_path"; then
+          rm -f "$legacy_source"
           echo "[PROMOTE ${legacy_origin} ${date_source} ${discovery_date}] $name (preserved historical hash)"
           return
         else
-          echo "[FAIL-PROMOTE] $name (could not rename $legacy_source → $chk_path)"
+          rm -f "$_ptmp" 2>/dev/null || true
+          echo "[FAIL-PROMOTE] $name (could not normalize/write $legacy_source → $chk_path)"
           return
         fi
       else
