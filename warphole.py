@@ -28,7 +28,7 @@
 #     $WARPHOLE_SECRETS_FILE — a plain `KEY="value"` fragment, mode 600.
 #
 # DEPENDENCIES:
-#     Python 3.6+, packages: requests (check/stats), rich (stats).
+#     Python 3.7+, packages: requests (check/stats), rich (stats).
 #     Binaries: docker (if IS_DOCKER) or pihole-FTL/pihole (bare metal);
 #     mount.cifs + findmnt (if SMB); ping (if CHECK_TAILSCALE).
 

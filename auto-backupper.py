@@ -23,7 +23,7 @@
 #     -h, --help          Show this help
 #
 # DEPENDENCIES:
-#     Python 3.6+; binaries: tar, rsync, find, sha256sum; pigz, docker (optional).
+#     Python 3.7+; binaries: tar, rsync, find, sha256sum; pigz, docker (optional).
 # ==============================================================================
 
 import os

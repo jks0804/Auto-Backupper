@@ -8,7 +8,7 @@ Auto-Backupper
 This is the **Python port** of Auto-Backupper, a faithful reimplementation of the original
 Bash suite (which lives on the [`main`](../../tree/main) branch and remains the primary,
 production-grade implementation). This port trades the Bash suite's breadth for a
-leaner, dependency-light codebase that is easier to read, extend, and run anywhere Python 3.6+
+leaner, dependency-light codebase that is easier to read, extend, and run anywhere Python 3.7+
 is available.
 
 > **Looking for the full suite?** The Bash branch (`main`) is the reference implementation and
@@ -58,7 +58,7 @@ is available.
 🔧 Requirements
 ---------------
 
-- **Python 3.6+**
+- **Python 3.7+**
 - **Run as root** (all three scripts hard-require `uid 0`).
 - **System binaries:**
   - `auto-backupper.py` / `watchtower.py`: `rsync`, `tar`, `sha256sum` (pre-flight enforced);
