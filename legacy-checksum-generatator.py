@@ -41,7 +41,10 @@ LOCKFILE = "/var/lock/auto_backupper.lock"
 # Archive name patterns the scan accepts. The bash uses `-name "*.*"` as a
 # catch-all, so in practice any file with a dot (that isn't a checksum / temp /
 # corruption-report file) qualifies.
-_EXCLUDE_PATTERNS = ("*.sha256", "*.sha256.tmp.*", "*_corruption_report.txt")
+_EXCLUDE_PATTERNS = (
+    "*.sha256", "*.sha256.tmp.*", "*_corruption_report.txt",
+    "*.part", "*.partial", "*.tmp", "*.tmp.*",
+)
 
 _DATED_GLOB = "_" + "[0-9]" * 8 + ".sha256"  # <name>_YYYYMMDD.sha256
 _lock_fd = None
@@ -54,11 +57,31 @@ def get_chk_dir(file_path, base):
     return os.path.join(base, CHECKSUM_DIR, os.path.dirname(rel))
 
 
+def _valid_date(d):
+    # True only for an 8-digit string that is a real calendar date in a sane
+    # year range, so a resolution (19201080), serial, or Feb-30 is never used
+    # as a discovery date (which drives the suite's retention/eviction).
+    if not re.match(r"^[0-9]{8}$", d):
+        return False
+    import datetime
+
+    try:
+        datetime.datetime.strptime(d, "%Y%m%d")
+    except ValueError:
+        return False
+    return 1990 <= int(d[:4]) <= 2100
+
+
 def last_embedded_date(name):
-    # Last `_YYYYMMDD` group in the filename, matching the produce-flow
-    # convention of appending CDATE as the terminal suffix. None if absent.
-    m = re.findall(r"_(\d{8})", name)
-    return m[-1] if m else None
+    # The LAST 8-digit token in the filename that is a valid calendar date.
+    # Tokenise on non-digit runs (not a `_\d{8}` regex) so a 9+-digit serial
+    # whose leading 8 happen to look like a date is rejected outright. None if
+    # the name carries no valid embedded date.
+    best = None
+    for tok in re.split(r"[^0-9]+", name):
+        if len(tok) == 8 and _valid_date(tok):
+            best = tok
+    return best
 
 
 def mtime_date(file_path):
@@ -70,17 +93,30 @@ def mtime_date(file_path):
         return ""
 
 
+def _legacy_digest(path):
+    # The bare 64-hex sha256 from a legacy checksum file: the first line that is
+    # EXACTLY 64 hex chars optionally followed by whitespace + filename (the
+    # standard sha256sum format). Anchored and length-bounded so a sha512 digest
+    # (128 hex), prose, or a 64-hex filename token is rejected. None if absent.
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                m = re.match(rb"^([a-fA-F0-9]{64})([ \t\r\n]|$)", line)
+                if m:
+                    return m.group(1).decode("ascii")
+    except OSError:
+        pass
+    return None
+
+
 def has_sha256_hex(path):
-    # Non-empty and contains a 64-hex-char run — guards against promoting a
-    # torn / empty legacy checksum. Read bytes so a binary/garbled file can't
-    # raise UnicodeDecodeError (bash grep tolerates it).
+    # Promotable only if the file yields a bare 64-hex sha256 (see _legacy_digest).
     try:
         if os.path.getsize(path) == 0:
             return False
-        with open(path, "rb") as f:
-            return re.search(rb"[a-fA-F0-9]{64}", f.read()) is not None
     except OSError:
         return False
+    return _legacy_digest(path) is not None
 
 
 def _safe_remove(path):
@@ -167,11 +203,24 @@ def generate_checksum(file_path, base, force):
         elif os.path.isfile(legacy_next_to_file):
             legacy_source, legacy_origin = legacy_next_to_file, "next-to-file"
         if legacy_source:
-            if has_sha256_hex(legacy_source):
-                if _move(legacy_source, chk_path):
+            digest = _legacy_digest(legacy_source)
+            if digest:
+                # Normalise to the bare-digest form the suite's verify_file
+                # expects (it compares the whole file, stripped, against
+                # sha256sum's first field). Renaming a `<hash>  <filename>`
+                # legacy file verbatim would fuse the filename onto the hash —
+                # permanent false corruption on every later verify. Preserve
+                # the historical hash, written atomically.
+                tmp = f"{chk_path}.tmp.{os.getpid()}"
+                try:
+                    with open(tmp, "w") as f:
+                        f.write(digest + "\n")
+                    os.replace(tmp, chk_path)
+                    _safe_remove(legacy_source)
                     print(f"[PROMOTE {legacy_origin} {date_source} {discovery_date}] {name} (preserved historical hash)")
-                else:
-                    print(f"[FAIL-PROMOTE] {name} (could not rename {legacy_source} → {chk_path})")
+                except OSError:
+                    _safe_remove(tmp)
+                    print(f"[FAIL-PROMOTE] {name} (could not normalize/write {legacy_source} → {chk_path})")
                 return
             print(f"[INVALID-LEGACY] {name}: {legacy_source} missing usable sha256 — falling through to GEN")
 
