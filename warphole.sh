@@ -924,7 +924,13 @@ run_health_check() {
 		# nor (bare-assignment) aborts the script under set -e.
 		STATS_DATA=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${HEADER_ARG[@]}") || padd_rc=$?
 		dlog "padd attempt $_attempt/$_max_attempts: rc=$padd_rc len=${#STATS_DATA}"
-		if ((padd_rc != 0)) || [[ -z "$STATS_DATA" ]] || ! echo "$STATS_DATA" | jq -e . >/dev/null 2>&1; then
+		# Require a JSON OBJECT, not merely valid JSON. A bare array/string/number
+		# ([], "x", 0) passes `jq -e .` but then `jq -r '.gravity_size'` errors
+		# "Cannot index ... with string", which under set -e+pipefail aborts the
+		# whole script. A non-object /padd reply means "not behaving like FTL"
+		# (wrong port, captive portal, proxy error page rendered as JSON) — treat
+		# it as unreachable (never rebuild), same as an empty/non-JSON body.
+		if ((padd_rc != 0)) || [[ -z "$STATS_DATA" ]] || ! echo "$STATS_DATA" | jq -e 'type=="object"' >/dev/null 2>&1; then
 			API_STATE="unreachable"
 			((_attempt < _max_attempts)) && sleep 5
 			continue
@@ -934,8 +940,10 @@ run_health_check() {
 			API_STATE="autherror"
 		else
 			# WS16: keep the raw value so the log can tell null/-2/0 apart.
-			RAW_GRAVITY=$(echo "$STATS_DATA" | jq -r '.gravity_size')
-			DOMAINS_COUNT=$(echo "$STATS_DATA" | jq -r '.gravity_size // 0')
+			# `.gravity_size?` + 2>/dev/null + fallback: belt-and-suspenders so an
+			# unexpected jq error can never abort the script via the bare assignment.
+			RAW_GRAVITY=$(echo "$STATS_DATA" | jq -r '.gravity_size? // empty' 2>/dev/null || echo "")
+			DOMAINS_COUNT=$(echo "$STATS_DATA" | jq -r '.gravity_size? // 0' 2>/dev/null || echo 0)
 			[[ "$DOMAINS_COUNT" =~ ^[0-9]+$ ]] || DOMAINS_COUNT=0
 			if ((DOMAINS_COUNT > 0)); then API_STATE="ok"; else API_STATE="broken"; fi
 		fi
@@ -979,7 +987,7 @@ run_health_check() {
 		NEW_STATS_DATA=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${HEADER_ARG[@]}") || true
 
 		# WS9: same validity check for the verification call.
-		if [[ -z "$NEW_STATS_DATA" ]] || ! echo "$NEW_STATS_DATA" | jq -e . >/dev/null 2>&1; then
+		if [[ -z "$NEW_STATS_DATA" ]] || ! echo "$NEW_STATS_DATA" | jq -e 'type=="object"' >/dev/null 2>&1; then
 			log "WARN: API unreachable during gravity verification. Assuming rebuild failed."
 			NEW_DOMAINS_COUNT=0
 		else
@@ -1046,7 +1054,7 @@ run_health_check() {
 				local RETRY_STATS RETRY_COUNT=0
 				# WD3: set -e guard — FTL may still be reloading after the restart.
 				RETRY_STATS=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${RETRY_HDR[@]}") || true
-				if [[ -n "$RETRY_STATS" ]] && echo "$RETRY_STATS" | jq -e . >/dev/null 2>&1; then
+				if [[ -n "$RETRY_STATS" ]] && echo "$RETRY_STATS" | jq -e 'type=="object"' >/dev/null 2>&1; then
 					RETRY_COUNT=$(echo "$RETRY_STATS" | jq -r '.gravity_size // 0')
 					[[ "$RETRY_COUNT" =~ ^[0-9]+$ ]] || RETRY_COUNT=0
 				fi
