@@ -401,7 +401,8 @@ ONLY_PHASES=()
 while [[ $# -gt 0 ]]; do
 	case $1 in
 	--dry-run) DRY_RUN=true ;;
-	--mode)
+	--mode | -m)
+		[[ -z "${2:-}" ]] && { echo "ERROR: --mode requires a value (produce|pull|both)"; exit 1; }
 		MODE="$2"
 		shift
 		;;
@@ -1690,7 +1691,7 @@ produce_flow() {
 					if [[ "$SQL_TYPE" == "mysql" ]]; then
 						mapfile -t dbs < <($DOCKER_CMD exec -e "MYSQL_PWD=$SQL_PASS" "$SQL_CONTAINER_NAME" "$SQL_CLI_BIN" -h "$SQL_HOST" -u "$SQL_USER" -e 'show databases' -s --skip-column-names | grep -Ev '^(information_schema|mysql|performance_schema|sys)$' || true)
 					else
-						mapfile -t dbs < <($DOCKER_CMD exec -e PGPASSWORD="$SQL_PASS" "$SQL_CONTAINER_NAME" psql -h "$SQL_HOST" -U "$SQL_USER" -t -c "SELECT datname FROM pg_database WHERE datistemplate = false;" || true)
+						mapfile -t dbs < <($DOCKER_CMD exec -e PGPASSWORD="$SQL_PASS" "$SQL_CONTAINER_NAME" psql -h "$SQL_HOST" -U "$SQL_USER" -At -c "SELECT datname FROM pg_database WHERE datistemplate = false;" || true)
 					fi
 				fi
 				for db in "${dbs[@]}"; do
@@ -2288,7 +2289,8 @@ pull_flow() {
 						done
 
 						if [[ $repull_count -gt 0 ]]; then
-							log "Corruption detected: $repull_count file(s). Batch re-pulling from $active_source..."
+							log "WARN: Corruption detected: $repull_count file(s). Batch re-pulling from $active_source..."
+							send_notify "warning" "Pull Corruption Detected" "$repull_count file(s) failed verification; re-pulling from $active_source."
 							# --progress removed: per-file progress floods the log for
 							# large batches. --timeout=60 makes rsync fail fast on a
 							# stale remote mount instead of hanging indefinitely on
