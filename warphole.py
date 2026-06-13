@@ -587,6 +587,10 @@ def run_backup():
         sys.exit(1)
 
     # --- 2. Generate backup ---
+    # Clear staging residue from a crashed run or a prior --keep-local first, so
+    # the sorted(glob)[0] pick below cannot offload a stale zip under today's
+    # name.
+    shutil.rmtree(CONFIG["TEMP_DIR"], ignore_errors=True)
     os.makedirs(CONFIG["TEMP_DIR"], exist_ok=True)
     log("Phase: Generating Teleporter Archive...")
 
@@ -598,9 +602,12 @@ def run_backup():
 
         # Capture the generated filename from pihole-FTL stdout, isolating the
         # teleporter zip line (FTL v6 prints config-parsing noise first).
+        # capture_output= cannot be combined with stdout=/stderr= (ValueError on
+        # every 3.7+); set them explicitly to keep stdout while silencing FTL's
+        # config-parse noise on stderr.
         raw = subprocess.run(
             ["docker", "exec", "-w", "/tmp", name, "pihole-FTL", "--teleporter"],
-            capture_output=True, text=True, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         ).stdout
         matches = re.findall(r"\S+_teleporter_\S+\.zip", raw)
         if not matches:
@@ -1312,7 +1319,13 @@ def main():
                 sys.exit(0)
             elif a == "--unmount-only":
                 if os.path.ismount(CONFIG["MOUNT_POINT"]):
-                    subprocess.run(["umount", CONFIG["MOUNT_POINT"]])
+                    # Lazy fallback on a busy mount (mirrors cleanup() and the
+                    # bash `umount || umount -l`) so an open handle doesn't leave
+                    # the share mounted with a bare non-zero exit.
+                    if subprocess.run(["umount", CONFIG["MOUNT_POINT"]],
+                                      stderr=subprocess.DEVNULL).returncode != 0:
+                        subprocess.run(["umount", "-l", CONFIG["MOUNT_POINT"]],
+                                       stderr=subprocess.DEVNULL)
                 sys.exit(0)
             elif a == "--keep-local":
                 state["keep_local"] = True
