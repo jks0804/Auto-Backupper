@@ -109,6 +109,10 @@ NC='\033[0m' # No Color
 # --- Runtime Flags (Do not edit) ---
 KEEP_LOCAL=false
 MANAGE_MOUNT=true
+# WE_MOUNTED is set true ONLY after mount_smb itself performs the mount this run.
+# cleanup() requires it before unmounting, so a pre-existing/foreign mount (or one
+# a prior --mount-only deliberately left holding) is never torn down by us.
+WE_MOUNTED=false
 MODE=""
 SID=""
 
@@ -297,7 +301,7 @@ cleanup() {
 	fi
 
 	# Auto-Unmount
-	if [[ "$DESTINATION_TYPE" == "smb" && "$MANAGE_MOUNT" == "true" ]]; then
+	if [[ "$DESTINATION_TYPE" == "smb" && "$MANAGE_MOUNT" == "true" && "$WE_MOUNTED" == "true" ]]; then
 		if mountpoint -q "$MOUNT_POINT"; then
 			[[ "$MODE" != "stats" ]] && log "Cleanup: Unmounting share..."
 			umount "$MOUNT_POINT" || umount -l "$MOUNT_POINT" || true
@@ -457,6 +461,9 @@ mount_smb() {
 	fi
 
 	if [[ $mount_rc -eq 0 ]]; then
+		# We created this mount this run — cleanup() may tear it down (unless a
+		# caller like --mount-only sets MANAGE_MOUNT=false to hold it).
+		WE_MOUNTED=true
 		log "SUCCESS: Share mounted."
 	else
 		log "FATAL: Failed to mount SMB share (exit code $mount_rc)."
@@ -558,11 +565,22 @@ run_backup() {
 		# WS15: pihole-FTL v6 prints FTLCONF env var parsing messages to stdout
 		# BEFORE the filename. Isolate the teleporter zip line; fall back to the
 		# last line ending in .zip if the naming convention ever changes.
-		local RAW_OUTPUT DOCKER_FILE
-		RAW_OUTPUT=$(docker exec -w /tmp "$DOCKER_CONTAINER_NAME" pihole-FTL --teleporter 2>/dev/null)
-		DOCKER_FILE=$(printf '%s\n' "$RAW_OUTPUT" | grep -oE '[^[:space:]]+_teleporter_[^[:space:]]+\.zip' | tail -n 1)
+		local RAW_OUTPUT DOCKER_FILE teleporter_rc=0
+		# WD3/WD5: capture the rc explicitly. A bare `RAW_OUTPUT=$(docker exec …)`
+		# aborts the whole script under set -e if the container is OOM-killed/stopped
+		# or FTL crashes — before the empty-filename FATAL below can fire (the
+		# "backup silently vanishes" symptom). The comment that claimed this branch
+		# was already guarded was wrong; this is the actual guard.
+		RAW_OUTPUT=$(docker exec -w /tmp "$DOCKER_CONTAINER_NAME" pihole-FTL --teleporter 2>/dev/null) || teleporter_rc=$?
+		if [[ $teleporter_rc -ne 0 ]]; then
+			log "FATAL: pihole-FTL --teleporter failed in container '$DOCKER_CONTAINER_NAME' (rc=$teleporter_rc; container may be unhealthy or OOM-killed)."
+			exit 1
+		fi
+		# `|| true` so a no-match grep (pipefail would make it rc=1) can't abort the
+		# script before the empty-filename check below handles it.
+		DOCKER_FILE=$(printf '%s\n' "$RAW_OUTPUT" | grep -oE '[^[:space:]]+_teleporter_[^[:space:]]+\.zip' | tail -n 1 || true)
 		if [[ -z "$DOCKER_FILE" ]]; then
-			DOCKER_FILE=$(printf '%s\n' "$RAW_OUTPUT" | grep -oE '[^[:space:]]+\.zip' | tail -n 1)
+			DOCKER_FILE=$(printf '%s\n' "$RAW_OUTPUT" | grep -oE '[^[:space:]]+\.zip' | tail -n 1 || true)
 		fi
 		DOCKER_FILE=$(printf '%s' "$DOCKER_FILE" | tr -d '\r\n')
 		DOCKER_FILE="${DOCKER_FILE## }"
@@ -658,6 +676,22 @@ run_backup() {
 				exit 1
 			fi
 			log "VERIFIED: Zip integrity OK (unzip -t)"
+		else
+			# Dependency-free fallback when unzip is absent (it is NOT in check_deps).
+			# A real Teleporter zip starts with the ZIP magic 'PK\x03\x04' and is
+			# several KB; an API error-body / truncated file does not. Without this,
+			# the (trivial, same-fs) checksum compare above would let a corrupt zip
+			# get a dated checksum and be trusted suite-wide.
+			local _magic _size
+			_magic=$(head -c 2 "$TARGET_PATH" 2>/dev/null || echo "")
+			_size=$(stat -c%s "$TARGET_PATH" 2>/dev/null || echo 0)
+			[[ "$_size" =~ ^[0-9]+$ ]] || _size=0
+			if [[ "$_magic" != "PK" ]] || ((_size < 100)); then
+				log "ERROR: Destination zip failed fallback integrity check (magic='${_magic}', size=${_size}B; 'unzip' not installed)."
+				rm -f "$TARGET_PATH" 2>/dev/null || true
+				exit 1
+			fi
+			log "WARN: 'unzip' not installed — validated only ZIP magic bytes + size floor. Install 'unzip' for full integrity testing."
 		fi
 
 		# --- 4b. Persist dated checksum under .checksums/ ---
@@ -674,14 +708,35 @@ run_backup() {
 		#   ${BACKUP_ROOT}/${SMB_SUBFOLDER}/<name>.zip
 		#   ${BACKUP_ROOT}/.checksums/${SMB_SUBFOLDER}/<name>.zip_<CDATE>.sha256
 		# where BACKUP_ROOT is the share root (the parent of SMB_SUBFOLDER).
-		local BACKUP_ROOT
+		# Co-locate the .checksums/ tree with wherever the data zip ACTUALLY landed,
+		# so the suite's pull/rotation (which derives the data path from the
+		# checksum's location relative to the backup root) can always map the two.
+		# Previously BACKUP_ROOT was hardcoded to /mnt/user/$SMB_SHARE for local,
+		# which broke when LOCAL_EXPORT_PATH was overridden (a documented option):
+		# the data went to the override path but the checksum stayed under the old
+		# root -> orphaned, mis-keyed retention. Derive root+relpath from the data
+		# destination instead.
+		local BACKUP_ROOT REL_SUBDIR
 		if [[ "$DESTINATION_TYPE" == "smb" ]]; then
 			BACKUP_ROOT="${MOUNT_POINT%/}"
+			REL_SUBDIR="$SMB_SUBFOLDER"
+		elif [[ "$FINAL_DEST_DIR" == */"$SMB_SUBFOLDER" ]]; then
+			# Default/convention case: LOCAL_EXPORT_PATH is <root>/<SMB_SUBFOLDER>.
+			BACKUP_ROOT="${FINAL_DEST_DIR%/"$SMB_SUBFOLDER"}"
+			REL_SUBDIR="$SMB_SUBFOLDER"
 		else
-			BACKUP_ROOT="/mnt/user/${SMB_SHARE}"
+			# Flat LOCAL_EXPORT_PATH override: the data dir IS the backup root and
+			# the zip sits directly under it (no relpath).
+			BACKUP_ROOT="$FINAL_DEST_DIR"
+			REL_SUBDIR=""
 		fi
 		BACKUP_ROOT="${BACKUP_ROOT%/}"
-		local CHK_SUBDIR="${BACKUP_ROOT}/.checksums/${SMB_SUBFOLDER}"
+		local CHK_SUBDIR
+		if [[ -n "$REL_SUBDIR" ]]; then
+			CHK_SUBDIR="${BACKUP_ROOT}/.checksums/${REL_SUBDIR}"
+		else
+			CHK_SUBDIR="${BACKUP_ROOT}/.checksums"
+		fi
 		local CHK_PATH="${CHK_SUBDIR}/${TARGET_NAME}_${CDATE}.sha256"
 
 		if mkdir -p "$CHK_SUBDIR" 2>/dev/null; then
@@ -798,12 +853,30 @@ run_health_check() {
 
 	# --- A. Post-Reboot Recovery Check ---
 	if [[ -f "$REPAIR_MARKER" ]]; then
-		log "RECOVERY: Found repair marker ($REPAIR_MARKER)."
+		# Bounded retry. A persistent upstream/network outage is the SAME
+		# condition that caused the original failure, so re-running pihole -g
+		# under it re-clobbers gravity on every --check forever. Cap the attempts
+		# (the marker stores the count) and then require manual intervention
+		# instead of looping destructively. The cron interval is the backoff.
+		local _recov_attempts=0 _recov_max=3
+		_recov_attempts=$(cat "$REPAIR_MARKER" 2>/dev/null || echo 0)
+		[[ "$_recov_attempts" =~ ^[0-9]+$ ]] || _recov_attempts=0
+		log "RECOVERY: Found repair marker ($REPAIR_MARKER) — attempt $((_recov_attempts + 1))/${_recov_max}."
+
+		if ((_recov_attempts >= _recov_max)); then
+			log "FATAL: Gravity recovery has already failed ${_recov_attempts} times; NOT retrying automatically."
+			log "       The blocklist upstream is most likely unreachable. Restore connectivity, run"
+			log "       'pihole -g' manually to confirm, then remove $REPAIR_MARKER to re-arm recovery."
+			return 1
+		fi
+
+		# Record this attempt up front so a crash mid-rebuild still counts toward the cap.
+		printf '%s\n' "$((_recov_attempts + 1))" >"$REPAIR_MARKER" 2>/dev/null || true
 		log "ACTION: System has rebooted. Attempting to pull Gravity now..."
 
 		[[ "$IS_DOCKER" == "true" ]] && { ensure_pihole_running || exit 1; }
 		if ! run_gravity_rebuild "post-reboot recovery"; then
-			log "ERROR: Recovery gravity rebuild failed (see $GRAVITY_LOG). Leaving repair marker in place."
+			log "ERROR: Recovery gravity rebuild failed (see $GRAVITY_LOG). Leaving repair marker in place (attempt $((_recov_attempts + 1))/${_recov_max})."
 			exit 1
 		fi
 
@@ -831,56 +904,62 @@ run_health_check() {
 	local HEADER_ARG=()
 	[[ -n "$SID" ]] && HEADER_ARG=(-H "X-FTL-SID: $SID")
 
+	# WD4 (critical): an UNREACHABLE / empty / non-JSON API is NOT evidence the
+	# gravity DB is corrupt. It is exactly the state of a just-booted box with no
+	# upstream yet, FTL mid-reload, or a 127.0.0.1 blip — and that same no-upstream
+	# condition is precisely when `pihole -g` would FAIL to download blocklists and
+	# replace a good DB with an empty one (then, on low-RAM bare-metal, REBOOT).
+	# Earlier code treated empty/invalid JSON as "corrupt DB -> rebuild", which is
+	# the WD4 destructive failure. We now ONLY rebuild on a DEFINITIVE signal: a
+	# VALID JSON /padd response that reports gravity_size <= 0. Retry a few times
+	# first so a momentary blip self-heals; an unreachable API is reported and left
+	# alone (no rebuild, no reboot); an auth-error body is surfaced, never rebuilt.
 	dlog "pre-curl /padd"
-	local STATS_DATA padd_rc=0
-	# WS10: --max-time prevents a hung API from hanging the health check
-	# (the whole point of which is to detect a hung service).
-	# WD3: capture curl's rc instead of letting a BARE assignment abort the whole
-	# script under `set -e`. A connection-refused (FTL down, rc 7) or timeout
-	# (rc 28) on this command substitution would otherwise kill run_health_check
-	# silently — no FATAL, no exit line, the "vanishes right after pre-authenticate"
-	# symptom. On failure STATS_DATA stays empty and the empty/invalid-JSON branch
-	# below forces the rebuild path, which is the intended behavior.
-	STATS_DATA=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${HEADER_ARG[@]}") || padd_rc=$?
-	dlog "post-curl /padd (rc=$padd_rc, response length=${#STATS_DATA} bytes)"
-	[[ $padd_rc -ne 0 ]] && log "WARN: /padd curl failed (rc=$padd_rc) — treating API as down."
+	local STATS_DATA="" padd_rc=0 _attempt=0 _max_attempts=3
+	local DOMAINS_COUNT=0 RAW_GRAVITY="" API_STATE="unreachable"
+	while ((_attempt < _max_attempts)); do
+		_attempt=$((_attempt + 1))
+		padd_rc=0
+		# WS10/WD3: --max-time + captured rc so a hung/refused API neither hangs
+		# nor (bare-assignment) aborts the script under set -e.
+		STATS_DATA=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${HEADER_ARG[@]}") || padd_rc=$?
+		dlog "padd attempt $_attempt/$_max_attempts: rc=$padd_rc len=${#STATS_DATA}"
+		if ((padd_rc != 0)) || [[ -z "$STATS_DATA" ]] || ! echo "$STATS_DATA" | jq -e . >/dev/null 2>&1; then
+			API_STATE="unreachable"
+			((_attempt < _max_attempts)) && sleep 5
+			continue
+		fi
+		# Valid JSON. An .error body means auth is required (PI_PASSWORD wrong).
+		if echo "$STATS_DATA" | jq -e '.error' >/dev/null 2>&1; then
+			API_STATE="autherror"
+		else
+			# WS16: keep the raw value so the log can tell null/-2/0 apart.
+			RAW_GRAVITY=$(echo "$STATS_DATA" | jq -r '.gravity_size')
+			DOMAINS_COUNT=$(echo "$STATS_DATA" | jq -r '.gravity_size // 0')
+			[[ "$DOMAINS_COUNT" =~ ^[0-9]+$ ]] || DOMAINS_COUNT=0
+			if ((DOMAINS_COUNT > 0)); then API_STATE="ok"; else API_STATE="broken"; fi
+		fi
+		break
+	done
+	dlog "padd classify: API_STATE=$API_STATE gravity=$RAW_GRAVITY count=$DOMAINS_COUNT"
 
-	# WS9 (revised): empty/invalid JSON used to early-return here, which
-	# swallowed the corrupt-DB recovery path — when the DB swap fails badly
-	# enough that FTL returns a non-JSON error body (instead of a clean
-	# gravity_size: -2), we still want to rebuild. Log the diagnostic and
-	# fall through to the regex check below, which treats an empty value
-	# as 0 and triggers a rebuild (matching pre-refactor behavior).
-	local DOMAINS_COUNT RAW_GRAVITY
-	if [[ -z "$STATS_DATA" ]] || ! echo "$STATS_DATA" | jq -e . >/dev/null 2>&1; then
-		log "WARN: API returned empty/invalid JSON — treating as corrupt-DB and forcing rebuild."
-		RAW_GRAVITY="<invalid>"
-		DOMAINS_COUNT=0
-	else
-		# WS16: capture the raw value too so the diagnostic log can distinguish
-		# null (DB unreachable) from -2 (corrupt swap) from a true 0.
-		RAW_GRAVITY=$(echo "$STATS_DATA" | jq -r '.gravity_size')
-		DOMAINS_COUNT=$(echo "$STATS_DATA" | jq -r '.gravity_size // 0')
+	if [[ "$API_STATE" == "unreachable" ]]; then
+		log "ERROR: Pi-hole API unreachable after ${_max_attempts} attempts (rc=$padd_rc)."
+		log "       NOT rebuilding gravity: an unreachable API is not evidence the DB is bad"
+		log "       (the box may be booting, FTL reloading, or upstream/DNS down — the very"
+		log "        condition under which 'pihole -g' would wipe a good DB). Re-run --check"
+		log "        once /padd responds."
+		return 1
 	fi
 
-	# WD4: Distinguish "API requires auth" from "gravity DB is empty/corrupt". If
-	# this box has a Pi-hole password but PI_PASSWORD is empty/wrong, /padd returns
-	# a 401 JSON error body ({"error":{"key":"unauthorized",...}}) with curl rc=0,
-	# so the WD3 guard above does NOT catch it. Without this, that error body parses
-	# to gravity_size=null//0 and we would destructively rebuild gravity — and on a
-	# low-RAM bare-metal box, REBOOT — on EVERY check run. Surface it instead.
-	if [[ "$RAW_GRAVITY" != "<invalid>" ]] && echo "$STATS_DATA" | jq -e '.error' >/dev/null 2>&1; then
+	if [[ "$API_STATE" == "autherror" ]]; then
 		log "ERROR: /padd returned an API error: $(echo "$STATS_DATA" | jq -rc '.error' 2>/dev/null)."
 		log "       Pi-hole requires authentication but PI_PASSWORD is empty/wrong. NOT rebuilding gravity."
 		log "       Set PI_PASSWORD (ideally in ${SECRETS_FILE}, mode 600) to this box's API password."
 		return 0
 	fi
-
-	# Validate Integer (Catches API returning "-2" for corrupt DBs)
-	if ! [[ "$DOMAINS_COUNT" =~ ^[0-9]+$ ]]; then
-		log "ERROR: Invalid API response (gravity_size=$RAW_GRAVITY). Forcing gravity update..."
-		DOMAINS_COUNT=0
-	fi
+	# API_STATE is "ok" (gravity_size > 0) or "broken" (valid JSON, gravity_size <= 0).
+	# The gate below rebuilds only on "broken"; "ok" falls through to HEALTHY.
 
 	if [[ "$DOMAINS_COUNT" -le 0 ]]; then
 		log "CRITICAL: 0 domains blocked (gravity_size=$RAW_GRAVITY). Triggering gravity update..."
