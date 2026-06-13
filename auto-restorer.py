@@ -172,14 +172,34 @@ def load_config(path):
 # ==============================================================================
 
 
+def _subtract_months(d, months):
+    # Calendar-correct month subtraction: shift (year, month) back and clamp the
+    # day to the target month's last day (e.g. Mar 31 - 1 month -> Feb 28/29).
+    import calendar
+
+    total = (d.year * 12 + (d.month - 1)) - months
+    year, month = divmod(total, 12)
+    month += 1
+    last = calendar.monthrange(year, month)[1]
+    return datetime.date(year, month, min(d.day, last))
+
+
 def parse_duration_to_cutoff(text):
     # "5y" / "12m" / "365d" -> YYYYMMDD of (today - duration). None on bad input.
+    # Months/years use real calendar arithmetic (not 30/365-day approximations),
+    # so 12m == 1y and leap days are honored, matching bash `date -d "N ... ago"`.
     m = re.match(r"^([0-9]+)([dmy])$", text)
     if not m:
         return None
     n, unit = int(m.group(1)), m.group(2)
-    days = {"d": n, "m": n * 30, "y": n * 365}[unit]
-    return (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
+    today = datetime.date.today()
+    if unit == "d":
+        cutoff = today - datetime.timedelta(days=n)
+    elif unit == "m":
+        cutoff = _subtract_months(today, n)
+    else:  # "y"
+        cutoff = _subtract_months(today, n * 12)
+    return cutoff.strftime("%Y%m%d")
 
 
 def human_size(b):
@@ -512,7 +532,11 @@ def cmd_verify():
         return 0
     if status == "NO_CHECKSUM":
         log(f"  WARN: No checksum file for {archive} (watchtower may not have scanned yet)")
-        return 3
+        # A not-yet-scanned archive is a warning, not a failure — match
+        # cmd_verify_all so `--verify FILE || alert` doesn't false-alarm on a
+        # benign just-made backup. (cmd_restore checks the token itself and
+        # still refuses a real MISMATCH.)
+        return 0
     if status == "MISMATCH":
         log(f"  FAIL: Checksum mismatch for {archive}{chronic}")
         return 1
@@ -521,7 +545,7 @@ def cmd_verify():
         return 4
     if status == "NO_BASE":
         log(f"  WARN: {archive} is not under BACKUP_BASE; no checksum resolvable")
-        return 2
+        return 0
     return 0
 
 
@@ -889,7 +913,12 @@ Commands:
     --host HOSTNAME           Read another host's report (default: local short hostname)
   --restore ARCHIVE         Extract an archive (requires --target)
     --target PATH             Extraction destination
-    --only PATH               Extract only PATH from the archive (repeatable)
+    --only PATH               Extract only PATH (repeatable). PATH must match the
+                              member name AS STORED: systems/ archives store it
+                              root-relative (e.g. mnt/cache/appdata/plex, not
+                              appdata/plex); FamilyBackups archives prefix it
+                              with ./ (e.g. ./users/docs). Run --inspect ARCHIVE
+                              to see exact member names.
     --stop-docker             Stop Docker before extraction, restart after
     --force                   Skip confirmation prompts; create target if missing
     --no-verify               Skip pre-restore checksum check (NOT recommended)
@@ -970,7 +999,7 @@ def parse_args(argv):
             PRUNE_OLDER_THAN = need("--older-than"); i += 1
         elif a == "--commit":
             PRUNE_COMMIT = True
-        elif a.startswith("--config="):
+        elif a.startswith("--config=") or a.startswith("-c="):
             pass  # captured pre-scan
         elif a in ("--config", "-c"):
             i += 1  # consume value
@@ -1002,7 +1031,7 @@ def main():
     cli_config = ""
     prev = ""
     for a in argv:
-        if a.startswith("--config="):
+        if a.startswith("--config=") or a.startswith("-c="):
             cli_config = a.split("=", 1)[1]
         elif prev in ("--config", "-c"):
             cli_config = a
