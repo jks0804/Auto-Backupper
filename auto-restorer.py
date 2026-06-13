@@ -64,6 +64,7 @@ ONLY_PATHS = []
 
 DOCKER_WAS_STOPPED = False
 _lock_fd = None
+_worker_lock_fd = None  # held for the restore's lifetime to block the backup worker
 
 # Aggregated watchtower corruption report (path -> count) + loaded path.
 CORRUPTION_COUNTS = {}
@@ -826,13 +827,33 @@ def cmd_prune_checksums():
         return 1
 
     deleted = 0
+    skipped = 0
     for chk in candidates:
+        # Re-check data-file presence at DELETE time, not just at scan time. The
+        # scan->confirm window can be long and prune holds no lock, so watchtower
+        # could re-stamp or a pull re-create the data file since the scan;
+        # deleting its checksum then strands a present-but-unverifiable backup.
+        # Re-derive the dated reading and also honour the legacy un-dated reading
+        # (a "<name>_<8digits>.sha256" whose data is "<name>_<8digits>").
+        m = re.search(r"_([0-9]{8})\.sha256$", os.path.basename(chk))
+        if m:
+            ds = m.group(1)
+            rel_with_suffix = os.path.relpath(chk, chk_root)
+            data_rel = rel_with_suffix[: -len(f"_{ds}.sha256")]
+            legacy_rel = rel_with_suffix[: -len(".sha256")]
+            if (os.path.isfile(os.path.join(base, data_rel))
+                    or os.path.isfile(os.path.join(base, legacy_rel))):
+                log(f"SKIP (data file present, keeping checksum): {chk}")
+                skipped += 1
+                continue
         try:
             os.remove(chk)
             deleted += 1
         except OSError:
             pass
     log(f"Deleted {deleted}/{len(candidates)} orphan checksum(s).")
+    if skipped:
+        log(f"Skipped {skipped} whose data file reappeared since the scan (kept their checksum).")
     try:
         os.remove(list_file)
     except OSError:
@@ -897,10 +918,16 @@ def parse_args(argv):
     n = len(argv)
 
     def need(flag):
-        if i + 1 >= n:
-            print(f"ERROR: {flag} requires a value", file=sys.stderr)
+        # Reject a missing OR flag-shaped next token. None of the value flags
+        # (paths/durations/hostnames) legitimately starts with '-', so a
+        # forgotten value like `--target --stop-docker` must error, not silently
+        # swallow the following flag as the value.
+        nxt = argv[i + 1] if i + 1 < n else None
+        if nxt is None or nxt.startswith("-"):
+            shown = nxt if nxt is not None else "<none>"
+            print(f"ERROR: {flag} requires a value (got '{shown}')", file=sys.stderr)
             sys.exit(1)
-        return argv[i + 1]
+        return nxt
 
     while i < n:
         a = argv[i]
@@ -958,7 +985,7 @@ def parse_args(argv):
 
 
 def main():
-    global BACKUP_BASE, _lock_fd
+    global BACKUP_BASE, _lock_fd, _worker_lock_fd
 
     if os.geteuid() != 0:
         print("CRITICAL: auto-restorer must be run as root.", file=sys.stderr)
@@ -997,6 +1024,23 @@ def main():
     # Lock only for the mutating restore; read-only modes run concurrently.
     if MODE == "restore":
         import fcntl
+
+        # Serialize against the backup worker first: it holds
+        # /var/lock/auto_backupper.lock for its whole run, including the
+        # rotation phase that os.remove()s aged archives. Probe it
+        # non-blockingly and refuse if active so a restore never reads an
+        # archive rotation is deleting (an operator restore is not covered by
+        # the cross-host "schedules never overlap" guarantee). Non-blocking,
+        # not a wait: the worker unlinks its lockfile while still holding it, so
+        # a waiter could win a stale inode while a fresh worker runs
+        # unserialized. Open "a+" so we never truncate the worker's file, and
+        # keep the FD for the restore's lifetime so a backup can't start.
+        _worker_lock_fd = open("/var/lock/auto_backupper.lock", "a+")
+        try:
+            fcntl.flock(_worker_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first.", file=sys.stderr)
+            sys.exit(1)
 
         # Open without truncating ("a+") so the previous PID stays readable
         # until we hold the lock; only then truncate + write our PID. Avoids the
