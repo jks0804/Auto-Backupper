@@ -660,7 +660,8 @@ def tar_compress_cmd():
 
 def rsync_base_opts():
     opts = ["--archive", "--compress", "--human-readable", "--omit-dir-times", "--update",
-            "--partial-dir=.abpartial", f"--include={CHECKSUM_DIR}", "--exclude=.abpartial", "--timeout=60"]
+            "--partial-dir=.abpartial", f"--include={CHECKSUM_DIR}", "--exclude=.abpartial",
+            "--exclude=.watchtower_state", "--timeout=60"]
     if CONFIG.get("LOG_VERBOSITY") == "debug":
         opts.append("--progress")
     return opts
@@ -1791,11 +1792,21 @@ def main():
         raise
 
     # Record successful completion for the watchtower scheduler (atomic write).
+    # Persist under the backup tree's .checksums/.watchtower_state/ (pruned by
+    # every checksum walk, and excluded from the inter-host pull rsync) so the
+    # marker survives a reboot — on Unraid /tmp is tmpfs. Must match
+    # watchtower.py's _compute_state_paths(); /tmp is the shared fallback.
     try:
-        tmp = f"/tmp/auto_backupper_last_run_backup.tmp.{os.getpid()}"
+        state_dir = os.path.join(CONFIG["BACKUP_BASE"], CHECKSUM_DIR, ".watchtower_state")
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+        except OSError:
+            state_dir = "/tmp"
+        marker = os.path.join(state_dir, "last_run_backup")
+        tmp = f"{marker}.tmp.{os.getpid()}"
         with open(tmp, "w") as f:
             f.write(datetime.datetime.now().strftime("%Y%m%d"))
-        os.replace(tmp, "/tmp/auto_backupper_last_run_backup")
+        os.replace(tmp, marker)
     except OSError:
         pass
     log("Job Finished.")

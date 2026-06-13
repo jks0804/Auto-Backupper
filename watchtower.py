@@ -157,6 +157,26 @@ def cfg_int(key, default=0):
         return default
 
 
+def _compute_state_paths():
+    # Anchor the scheduler last-run markers under the backup tree's
+    # .checksums/.watchtower_state/ so they survive a reboot (on Unraid /tmp is
+    # tmpfs, which wiped the old /tmp markers and re-fired same-day jobs), with
+    # a /tmp fallback. auto-backupper.py stamps last_run_backup at the same
+    # path; perform_scan prunes .checksums from its walk and auto-backupper's
+    # pull rsync excludes .watchtower_state, so the markers are never scanned
+    # or replicated across hosts.
+    global LAST_RUN_BACKUP, LAST_RUN_CLEANUP, LAST_RUN_VERIFY, LAST_RUN_UPDATE
+    state_dir = os.path.join(cfg("WATCH_DIR"), cfg("CHECKSUM_DIR"), ".watchtower_state")
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except OSError:
+        state_dir = "/tmp"
+    LAST_RUN_BACKUP = os.path.join(state_dir, "last_run_backup")
+    LAST_RUN_CLEANUP = os.path.join(state_dir, "last_run_cleanup")
+    LAST_RUN_VERIFY = os.path.join(state_dir, "last_run_verify")
+    LAST_RUN_UPDATE = os.path.join(state_dir, "last_run_update")
+
+
 # ==============================================================================
 # 3. CONFIG LOADING (bash-syntax cfg parser: scalars + the arrays we use)
 # ==============================================================================
@@ -398,15 +418,42 @@ def _pgrep(pattern):
                           stderr=subprocess.DEVNULL).returncode == 0
 
 
-def file_is_stable(path):
-    # Size unchanged across a 1s window => not actively being written.
+def file_is_stable(path, min_age=None, samples=None, interval=None):
+    # Stable only when the file has been quiet for >= min_age seconds AND its
+    # (size, mtime) are identical across `samples` checks `interval` apart. The
+    # old size-only/1s gate let a write that paused longer than the sample gap
+    # (sparse tar, stalled rsync, an out-of-band SMB/NFS upload) read as stable,
+    # so a checksum got stamped over a still-growing file.
+    if min_age is None:
+        min_age = cfg_int("SCAN_STABLE_MIN_AGE", 15)
+    if samples is None:
+        samples = cfg_int("SCAN_STABLE_SAMPLES", 3)
+    if interval is None:
+        interval = cfg_int("SCAN_STABLE_INTERVAL", 2)
+    if samples < 2:
+        samples = 2
     try:
-        s1 = os.path.getsize(path)
-        time.sleep(1)
-        s2 = os.path.getsize(path)
+        st = os.stat(path)
     except OSError:
         return False
-    return s1 == s2
+    now = time.time()
+    # Apply min-age only when mtime is in the past — a future mtime (NTP skew or
+    # a -p preserved timestamp) must not make a file look perpetually too young.
+    if now >= st.st_mtime and (now - st.st_mtime) < min_age:
+        return False
+    prev = None
+    for i in range(samples):
+        try:
+            s = os.stat(path)
+        except OSError:
+            return False
+        sig = (s.st_size, int(s.st_mtime))
+        if prev is not None and sig != prev:
+            return False
+        prev = sig
+        if i < samples - 1:
+            time.sleep(interval)
+    return True
 
 
 def is_backup_running():
@@ -478,16 +525,22 @@ def trigger_mover():
     log(f"ACTION: Triggering Mover ({cfg('MOVER_TYPE')})...")
     if cfg("MOVER_TYPE") == "internal":
         cache, array = cfg("CACHE_DIR"), cfg("ARRAY_BASE_PATH")
-        for root, _, files in os.walk(cache):
+        for root, dirs, files in os.walk(cache):
+            # .abpartial is rsync's --partial-dir: a DIRECTORY of in-progress
+            # transfer chunks under their real names. Pruning the dir (not just
+            # a file named .abpartial) keeps os.walk from moving a live partial
+            # off-cache with --remove-source-files mid-transfer.
+            if ".abpartial" in dirs:
+                dirs.remove(".abpartial")
             for fn in files:
-                if fn == ".abpartial":
-                    continue
                 src = os.path.join(root, fn)
                 if file_is_stable(src):
                     rel = os.path.relpath(src, cache)
                     dest = os.path.join(array, rel)
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    subprocess.run(["rsync", "-a", "--remove-source-files", src, dest])
+                    # --update so an older cache copy never overwrites a newer
+                    # array copy and then deletes its source (silent data loss).
+                    subprocess.run(["rsync", "-a", "--update", "--remove-source-files", src, dest])
         subprocess.run(["find", cache, "-type", "d", "-empty", "-delete"])
         return
     mover = "/usr/local/sbin/mover" if os.access("/usr/local/sbin/mover", os.X_OK) else shutil.which("mover")
@@ -507,6 +560,14 @@ def manage_cache_state():
     usage = get_cache_usage()
     if usage >= cfg_int("CACHE_CRITICAL", 90):
         send_notify("alert", "Cache Critical", f"Cache is at {usage}%")
+        # Defer the mover during a parity check (the threshold branch already
+        # does this) — running it mid-parity contends for disk heads and
+        # extends the reduced-redundancy window. FORCE_MOVER_ON_CRITICAL is the
+        # operator escape hatch.
+        if (is_parity_running() and not cfg_true("RUN_MOVER_DURING_PARITY")
+                and not cfg_true("FORCE_MOVER_ON_CRITICAL")):
+            log(f"Cache critical ({usage}%) but parity check running; deferring mover.")
+            return
         if is_backup_running() and not cfg_true("FORCE_MOVER_ON_CRITICAL"):
             return
         trigger_mover()
@@ -603,6 +664,15 @@ def run_docker_update_task():
 # ==============================================================================
 
 
+def _last_dom(year, month):
+    # Last day-of-month, handling Feb/leap years and 30/31-day months.
+    if month == 12:
+        nxt = datetime.date(year + 1, 1, 1)
+    else:
+        nxt = datetime.date(year, month + 1, 1)
+    return (nxt - datetime.timedelta(days=1)).day
+
+
 def should_run_schedule(mode, value, time_target, last_run_file):
     today = datetime.datetime.now().strftime("%Y%m%d")
     if os.path.isfile(last_run_file):
@@ -636,13 +706,30 @@ def should_run_schedule(mode, value, time_target, last_run_file):
         return True
 
     val_clean = str(value).lstrip("0") or "0"
-    day_clean = str(now.day)
+    # Clamp a 29/30/31 day target to this month's real last day so an
+    # end-of-month schedule still fires in Feb/Apr/Jun/Sep/Nov instead of being
+    # skipped until the overdue path fires it on the wrong day next month.
+    eff_day = int(val_clean) if val_clean.isdigit() else -1
+    if eff_day > 0:
+        eff_day = min(eff_day, _last_dom(now.year, now.month))
     if mode == "annually":
-        return now.month == 1 and day_clean == val_clean
+        # VALUE is "DD" (January, legacy form) or "MM/DD" / "MM-DD" to pick the
+        # month; the day is clamped to that month's real last day.
+        a_mon, a_dayspec = 1, str(value)
+        if "/" in a_dayspec or "-" in a_dayspec:
+            parts = re.split(r"[/-]", a_dayspec, maxsplit=1)
+            a_mon = int(parts[0]) if parts[0].isdigit() else 0
+            a_dayspec = parts[1]
+        a_day_clean = a_dayspec.lstrip("0") or "0"
+        a_day = int(a_day_clean) if a_day_clean.isdigit() else -1
+        if not (1 <= a_mon <= 12) or a_day <= 0:
+            return False
+        a_day = min(a_day, _last_dom(now.year, a_mon))
+        return now.month == a_mon and now.day == a_day
     if mode == "quarterly":
-        return now.month in (1, 4, 7, 10) and day_clean == val_clean
+        return now.month in (1, 4, 7, 10) and now.day == eff_day
     if mode == "monthly":
-        return day_clean == val_clean
+        return now.day == eff_day
     if mode == "weekly":
         return now.strftime("%a").lower() == str(value).lower()
     if mode == "daily":
@@ -706,13 +793,17 @@ def check_manual_triggers():
         log("MANUAL: Trigger received for Docker Update.")
         _safe_remove(TRIGGER_UPDATE)
         run_docker_update_task()
-    if os.path.isfile(TRIGGER_VERIFY):
+    # Defer (do NOT consume) a manual verify/scan while a backup is running:
+    # perform_scan would walk the live in-progress tree and checksum
+    # half-written archives (false CORRUPTION). Leaving the trigger file in
+    # place fires it automatically next cycle once the backup releases its lock.
+    if os.path.isfile(TRIGGER_VERIFY) and not is_backup_running():
         log("MANUAL: Trigger received for Full Verification.")
         _safe_remove(TRIGGER_VERIFY)
         send_notify("warning", "Manual Verify", "Starting deep scan...")
         perform_scan(cfg("WATCH_DIR"), True)
         send_notify("normal", "Manual Verify", "Scan complete.")
-    if os.path.isfile(TRIGGER_SCAN):
+    if os.path.isfile(TRIGGER_SCAN) and not is_backup_running():
         log("MANUAL: Trigger received for Quick Scan.")
         _safe_remove(TRIGGER_SCAN)
         perform_scan(cfg("WATCH_DIR"), False)
@@ -726,6 +817,12 @@ def check_manual_triggers():
             log(f"CONFIG: Switching config file to: {new_cfg}")
             CFG_TO_LOAD = new_cfg
             parse_bash_config(new_cfg)
+            # Re-derive config-dependent paths so a reloaded WATCH_DIR/HOSTNAME
+            # actually takes effect (mirrors the boot-time derivation in main).
+            global CORRUPTION_REPORT
+            CORRUPTION_REPORT = os.path.join(
+                cfg("WATCH_DIR"), cfg("CHECKSUM_DIR"), f"{cfg('HOSTNAME_VAR')}_corruption_report.txt")
+            _compute_state_paths()
         else:
             log(f"ERROR: Requested config {new_cfg} not found. Keeping previous.")
         _safe_remove(TRIGGER_CONFIG)
@@ -2145,6 +2242,7 @@ def main():
         OS_TYPE = "omv"
 
     CORRUPTION_REPORT = os.path.join(cfg("WATCH_DIR"), cfg("CHECKSUM_DIR"), f"{cfg('HOSTNAME_VAR')}_corruption_report.txt")
+    _compute_state_paths()
 
     mode, verify_flag = _parse_mode(argv)
     daemon_running, daemon_pid = _detect_daemon()
@@ -2152,9 +2250,12 @@ def main():
     # IPC: signal a running daemon and exit, instead of running standalone.
     if mode == "--reload":
         if daemon_running:
-            if CLI_CONFIG:
-                atomic_write(TRIGGER_CONFIG, CLI_CONFIG)
-                print(f"Queued config change to: {CLI_CONFIG}")
+            # Always queue the active config path so a bare `--reload` actually
+            # re-reads config: the daemon only re-parses on TRIGGER_CONFIG, so
+            # writing it only when --config was passed left a bare reload a
+            # no-op (every tunable kept its boot value until a full restart).
+            atomic_write(TRIGGER_CONFIG, CLI_CONFIG or CFG_TO_LOAD)
+            print(f"Queued config reload: {CLI_CONFIG or CFG_TO_LOAD}")
             notify_daemon("RELOAD", daemon_pid)
             sys.exit(0)
         print("Error: Daemon is not running. Cannot reload.")
