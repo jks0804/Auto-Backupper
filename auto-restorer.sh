@@ -1309,8 +1309,9 @@ cmd_prune_checksums() {
 	fi
 
 	local cutoff_date
-	cutoff_date=$(parse_duration_to_cutoff "$PRUNE_OLDER_THAN")
-	if [[ -z "$cutoff_date" ]]; then
+	# Use `if !` so a grammar mismatch (the function's `return 1`) doesn't trip
+	# set -e at the assignment before this friendly message can print.
+	if ! cutoff_date=$(parse_duration_to_cutoff "$PRUNE_OLDER_THAN") || [[ -z "$cutoff_date" ]]; then
 		log "ERROR: Invalid --older-than format: '$PRUNE_OLDER_THAN' — use Nd / Nm / Ny (e.g. 90d, 6m, 5y)"
 		return 1
 	fi
@@ -1436,12 +1437,15 @@ restore)
 	# phase that rm's aged archives. Without this a restore could read an
 	# archive the worker deletes mid-extraction (an operator-initiated restore
 	# is not covered by the cross-host "schedules never overlap" guarantee).
-	# Open with <> so we never truncate the worker's lockfile, and hold the FD
-	# for the restore's lifetime so rotation cannot run concurrently.
-	RESTORE_WORKER_LOCK_WAIT="${RESTORE_WORKER_LOCK_WAIT:-30}"
-	[[ "$RESTORE_WORKER_LOCK_WAIT" =~ ^[0-9]+$ ]] || RESTORE_WORKER_LOCK_WAIT=30
+	# Use a NON-BLOCKING probe (flock -n), not a wait: the worker unlinks its
+	# lockfile while still holding it (anti-stale-inode), so a restore that
+	# waited could win a lock on a now-unlinked inode while the next worker
+	# creates a fresh inode at the path and runs unserialized. Refusing while a
+	# backup is active avoids that race entirely. Open with <> so we never
+	# truncate the worker's lockfile, and hold the FD for the restore's
+	# lifetime so a backup cannot start mid-restore.
 	exec 201<>"/var/lock/auto_backupper.lock"
-	if ! flock -w "$RESTORE_WORKER_LOCK_WAIT" 201; then
+	if ! flock -n 201; then
 		echo "ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first." >&2
 		exit 1
 	fi

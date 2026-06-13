@@ -363,7 +363,7 @@ CLI_CONFIG=""
 # Accept both --config=PATH and --config PATH forms.
 prev_arg=""
 for arg in "$@"; do
-	if [[ "$arg" == --config=* ]]; then
+	if [[ "$arg" == --config=* || "$arg" == -c=* ]]; then
 		CLI_CONFIG="${arg#*=}"
 	elif [[ "$prev_arg" == "--config" || "$prev_arg" == "-c" ]]; then
 		CLI_CONFIG="$arg"
@@ -418,7 +418,7 @@ while [[ $# -gt 0 ]]; do
 		# Value already captured by the pre-scan loop above; just consume it.
 		shift
 		;;
-	--config=*)
+	--config=* | -c=*)
 		# Equals form — value already captured by the pre-scan loop above.
 		# Previously this fell through to `*)` Unknown argument, which broke
 		# `watchtower.sh --start-backup` (watchtower invokes the backup
@@ -884,7 +884,7 @@ echo $$ >"$BACKUP_PIDFILE" 2>/dev/null || true
 # source of log bloat. Only include it at debug verbosity. The base
 # options (archive/compress/timeout/etc.) are always present because
 # they affect correctness, not output volume.
-RSYNC_OPTS=(--archive --compress --human-readable --omit-dir-times --update --partial-dir=.abpartial --include="${CHECKSUM_DIR}" --exclude=.abpartial --timeout=60)
+RSYNC_OPTS=(--archive --compress --human-readable --omit-dir-times --update --partial-dir=.abpartial --include="${CHECKSUM_DIR}" --exclude=.abpartial --exclude=.watchtower_state --timeout=60)
 if [[ "${LOG_VERBOSITY:-info}" == "debug" ]]; then
 	RSYNC_OPTS+=(--progress)
 fi
@@ -2365,9 +2365,10 @@ main() {
 	# should_run_schedule would either re-fire the backup or fail to parse.
 	{
 		# Persist under the backup tree's .checksums/ (every find walk in the
-		# suite prunes it) so the marker survives a reboot — on Unraid /tmp is
-		# tmpfs. Must match watchtower's AB_STATE_DIR so its scheduler reads the
-		# same stamp; the /tmp fallback filename matches on both sides too.
+		# suite prunes it, and RSYNC_OPTS excludes .watchtower_state so it never
+		# replicates across hosts) so the marker survives a reboot — on Unraid
+		# /tmp is tmpfs. Must match watchtower's AB_STATE_DIR so its scheduler
+		# reads the same stamp; the /tmp fallback filename matches on both sides.
 		_lr_state_dir="${BACKUP_BASE}/${CHECKSUM_DIR}/.watchtower_state"
 		mkdir -p "$_lr_state_dir" 2>/dev/null || _lr_state_dir="/tmp"
 		_lr_tmp="${_lr_state_dir}/last_run_backup.tmp.$$"

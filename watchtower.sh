@@ -1569,8 +1569,11 @@ should_run_schedule() {
 	# Force base-10: stripping a single leading zero leaves "0MM" for the
 	# 00:xx hour, and 08/09 are invalid octal digits in arithmetic context, so
 	# `-lt` would error and fall through (firing the schedule early). Compare
-	# the raw HHMM values with an explicit 10# radix instead.
-	if (( 10#${current_hm:-0} < 10#${target_hm:-0} )); then echo "false"; return; fi
+	# the raw HHMM values with an explicit 10# radix; coerce a non-numeric
+	# configured time to 0 so a typo'd SCHEDULER_TIME can't spew base errors.
+	[[ "$current_hm" =~ ^[0-9]+$ ]] || current_hm=0
+	[[ "$target_hm" =~ ^[0-9]+$ ]] || target_hm=0
+	if (( 10#$current_hm < 10#$target_hm )); then echo "false"; return; fi
 
 	# S6: Overdue recovery. If the daemon was down through the scheduled window
 	# (e.g. host rebooted across a 02:00 weekly Saturday schedule and came up
@@ -1767,6 +1770,18 @@ check_manual_triggers() {
 				source "$CFG_TO_LOAD"
 				# Re-derive config-dependent vars so they track the reloaded values.
 				CORRUPTION_REPORT="${WATCH_DIR}/${CHECKSUM_DIR}/${HOSTNAME_VAR}_corruption_report.txt"
+				# The scheduler markers are anchored to WATCH_DIR, so re-derive
+				# them too or a reloaded WATCH_DIR change would leave them under
+				# the old tree (CORRUPTION_REPORT is re-derived for the same
+				# reason). Keep these in sync with the boot-time block above.
+				AB_STATE_DIR="${WATCH_DIR}/${CHECKSUM_DIR}/.watchtower_state"
+				mkdir -p "$AB_STATE_DIR" 2>/dev/null || AB_STATE_DIR="/tmp"
+				LAST_RUN_BACKUP="$AB_STATE_DIR/last_run_backup"
+				LAST_RUN_CLEANUP="$AB_STATE_DIR/last_run_cleanup"
+				LAST_RUN_VERIFY="$AB_STATE_DIR/last_run_verify"
+				LAST_RUN_UPDATE="$AB_STATE_DIR/last_run_update"
+				LAST_RUN_RECOVERY="$AB_STATE_DIR/last_run_recovery"
+				RECOVERY_LAST_PASS_EPOCH="$AB_STATE_DIR/recovery_epoch"
 				set -u
 				log "CONFIG: Reloaded $CFG_TO_LOAD (note: a changed WATCHTOWER_LOGFILE needs a daemon restart — the log FD is fixed for the daemon's life)."
 			else
@@ -3259,9 +3274,10 @@ _hub_daemon_start_inner() {
 	return 0
 }
 
-# Stop the watchtower daemon. SIGTERM first, give the daemon's EXIT
-# trap up to 5 seconds to clean up (it removes PID + STATUS files), then
-# escalate to SIGKILL if needed.
+# Stop the watchtower daemon. SIGTERM first, give the daemon's EXIT trap up to
+# DAEMON_SHUTDOWN_GRACE + 5 seconds (default 35) to clean up — it removes PID +
+# STATUS files and shepherds any in-flight docker update/recovery to a safe
+# point — then escalate to SIGKILL if needed.
 _hub_daemon_stop_inner() {
 	if [[ "$DAEMON_RUNNING" != "true" ]]; then
 		_hub_notice "Daemon is not running."

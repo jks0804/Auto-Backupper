@@ -144,7 +144,7 @@ if [[ -f "$SECRETS_FILE" ]]; then
 	fi
 	# shellcheck disable=SC1090
 	if ! source "$SECRETS_FILE"; then
-		echo "FATAL: $SECRETS_FILE failed to load (bash syntax error, or a command in it returned non-zero). Fix or remove it." >&2
+		echo "FATAL: $SECRETS_FILE failed to load (bash syntax error, or its last statement returned non-zero). Fix or remove it." >&2
 		exit 1
 	fi
 	unset _secrets_perms _secrets_owner
