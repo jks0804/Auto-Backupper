@@ -72,6 +72,8 @@ CORRUPTION_REPORT = ""        # derived after config load
 LAST_LOGGED_THREADS = -1      # prevents thread-count log flooding
 _corruption_lock = threading.Lock()
 _sigusr1 = False              # set by the daemon SIGUSR1 handler
+_stop_requested = False       # a SIGTERM/SIGINT arrived during a critical section
+_critical_depth = 0           # >0 while a destructive op (docker update) is in flight
 
 # ==============================================================================
 # 2. CONFIGURATION DEFAULTS (matches watchtower.sh; cfg overrides)
@@ -108,6 +110,11 @@ CONFIG = {
     "CACHE_CRITICAL": "90",
     "FORCE_MOVER_ON_CRITICAL": "false",
     "RUN_MOVER_DURING_PARITY": "false",
+
+    # --- File-stability gate (file_is_stable); tunable from the cfg ---
+    "SCAN_STABLE_MIN_AGE": "15",
+    "SCAN_STABLE_SAMPLES": "3",
+    "SCAN_STABLE_INTERVAL": "2",
 
     # --- Cleanup ---
     "CLEANUP_MEDIA_METADATA": "false",
@@ -193,8 +200,11 @@ def parse_bash_config(filepath):
     if not os.path.isfile(filepath):
         return
     try:
-        content = open(filepath).read()
-    except OSError:
+        # Explicit UTF-8 so a non-ASCII value (an accented share name, a
+        # webhook title) doesn't raise UnicodeDecodeError under a C/POSIX-locale
+        # default of ASCII and crash daemon startup.
+        content = open(filepath, encoding="utf-8").read()
+    except (OSError, UnicodeDecodeError):
         return
     import shlex
 
@@ -631,6 +641,7 @@ def _docker_inspect(name, fmt):
         return ""
 
 
+@_critical
 def run_docker_update_task():
     set_status("Checking Containers")
     log("UPDATER: Starting Container Check...")
@@ -1172,6 +1183,35 @@ def _daemon_signal_handler(signum, frame):
     global _sigusr1
     _sigusr1 = True
     log("EVENT: Signal received. Interrupting sleep cycle...")
+
+
+def _critical(fn):
+    # Mark a destructive op (docker update/recreate) as a critical section: a
+    # stop signal that arrives mid-op is deferred (see _daemon_shutdown_handler)
+    # until the op finishes, so a hub/CLI stop can't orphan a container between
+    # `docker rm` and recreate. After it completes, honor any deferred stop.
+    def wrapper(*args, **kwargs):
+        global _critical_depth
+        _critical_depth += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _critical_depth -= 1
+            if _critical_depth == 0 and _stop_requested:
+                log("SHUTDOWN: Critical section complete; honoring deferred stop.")
+                sys.exit(0)
+    return wrapper
+
+
+def _daemon_shutdown_handler(signum, frame):
+    # Exit immediately when idle; if a critical section is in flight, defer the
+    # exit (the hub/CLI waits DAEMON_SHUTDOWN_GRACE+5s before escalating).
+    global _stop_requested
+    if _critical_depth > 0:
+        _stop_requested = True
+        log("SHUTDOWN: Stop signal during a critical section; deferring until it completes.")
+        return
+    sys.exit(0)
 
 
 def _parse_mode(argv):
@@ -2032,8 +2072,12 @@ def cmd_hub(daemon_running, daemon_pid):
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+        # Wait at least the daemon's graceful-shutdown grace before SIGKILL, so
+        # a stop mid docker-update/recovery isn't escalated before the daemon's
+        # deferred-shutdown can finish (matches the bash hub's grace+5 budget).
+        budget = cfg_int("DAEMON_SHUTDOWN_GRACE", 30) + 5
         waited = 0
-        while _pid_alive(pid) and waited < 5:
+        while _pid_alive(pid) and waited < budget:
             time.sleep(1)
             waited += 1
         if _pid_alive(pid):
@@ -2041,7 +2085,7 @@ def cmd_hub(daemon_running, daemon_pid):
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-            notice("Daemon SIGKILLed (didn't exit cleanly).")
+            notice(f"Daemon SIGKILLed (didn't exit cleanly after {budget}s).")
         else:
             notice("Daemon stopped.")
         redetect()
@@ -2299,8 +2343,8 @@ def main():
         signal.signal(signal.SIGUSR1, _daemon_signal_handler)
         import atexit
         atexit.register(lambda: (_safe_remove(PID_FILE), _safe_remove(STATUS_FILE)))
-        signal.signal(signal.SIGTERM, lambda s, fr: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda s, fr: sys.exit(0))
+        signal.signal(signal.SIGTERM, _daemon_shutdown_handler)
+        signal.signal(signal.SIGINT, _daemon_shutdown_handler)
         set_status("Idle")
 
     # Initialize the corruption report.
