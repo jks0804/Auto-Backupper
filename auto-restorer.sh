@@ -1056,9 +1056,9 @@ cmd_restore() {
 		# pass the user-supplied paths so the preview reflects exactly
 		# what will be extracted.
 		if [[ -n "$dflag" ]]; then
-			tar "$dflag" -tf "$archive" "${ONLY_PATHS[@]}" 2>/dev/null | head -10 | sed 's/^/    /' || true
+			tar "$dflag" -tf "$archive" -- "${ONLY_PATHS[@]}" 2>/dev/null | head -10 | sed 's/^/    /' || true
 		else
-			tar -tf "$archive" "${ONLY_PATHS[@]}" 2>/dev/null | head -10 | sed 's/^/    /' || true
+			tar -tf "$archive" -- "${ONLY_PATHS[@]}" 2>/dev/null | head -10 | sed 's/^/    /' || true
 		fi
 	else
 		echo "  First 10 entries in the archive:"
