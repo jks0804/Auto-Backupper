@@ -80,11 +80,52 @@ if [[ ! -d "$TARGET_DIR" ]]; then
   echo "CRITICAL: Target directory does not exist: $TARGET_DIR"
   exit 1
 fi
+# Strip any trailing slash (tab-completion adds one). Without this, the
+# get_chk_dir prefix-strip sees a double slash, fails to strip, and writes
+# every checksum under the full absolute path — orphaning it from the suite's
+# verify/retention, which then silently never finds it.
+TARGET_DIR="${TARGET_DIR%/}"
 
 get_chk_dir() {
   # $1 = Full File Path, $2 = Base Directory → echo checksum subdir
-  local rel="${1#$2/}"
+  # $2 is QUOTED in the strip pattern: without quotes a base path containing
+  # glob metacharacters ([ ] * ?) is treated as a pattern and fails to strip,
+  # leaving rel as the full absolute path and orphaning the checksum. Mirrors
+  # auto-backupper.sh's checksum_write_path (${file#"$base"/}). The caller also
+  # normalises the trailing slash off TARGET_DIR so the prefix matches cleanly.
+  local rel="${1#"$2"/}"
   echo "$2/${CHECKSUM_DIR}/$(dirname "$rel")"
+}
+
+# Validate that an 8-digit string is a plausible calendar date (YYYYMMDD).
+# The "last 8-digit group wins" rule is correct for suite-produced names
+# (terminal _<CDATE> before the extension) but mis-fires on legacy/external
+# names containing non-date 8-digit runs — a 1920x1080 resolution (19201080),
+# an account/serial number, a trailing version. A bogus date becomes the
+# checksum's suffix, which auto-backupper rotation uses as the retention
+# source of truth -> a fresh backup stamped year 1920 is evicted on the next
+# pass. Validating here (and gating REALIGN on it) prevents that data loss.
+_valid_date() {
+  local d="$1"
+  [[ "$d" =~ ^[0-9]{8}$ ]] || return 1
+  local y="${d:0:4}" m="${d:4:2}" day="${d:6:2}"
+  ((10#$y >= 1990 && 10#$y <= 2100)) || return 1
+  ((10#$m >= 1 && 10#$m <= 12)) || return 1
+  ((10#$day >= 1 && 10#$day <= 31)) || return 1
+  # Final authority: reject impossible calendar dates (Feb 30, Apr 31, …).
+  date -d "${y}-${m}-${day}" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# Echo the discovery date embedded in a filename: the LAST _<8digits> group
+# that is a VALID calendar date (so a trailing serial can't beat the real
+# leading date, and a non-date run is ignored). Empty if none is valid.
+_embedded_date() {
+  local name="$1" g best=""
+  for g in $(echo "$name" | grep -oE '_[0-9]{8}' | sed 's/^_//' || true); do
+    if _valid_date "$g"; then best="$g"; fi
+  done
+  printf '%s' "$best"
 }
 
 generate_checksum() {
@@ -156,10 +197,13 @@ generate_checksum() {
       # fallback for files with no embedded date, but using mtime to
       # rewrite an existing first-sighting stamp would lose meaningful
       # history (the existing stamp is when this host first saw it).
-      local _want_date=""
-      local _last_embedded
-      _last_embedded="$(echo "$name" | grep -oE '_[0-9]{8}' | tail -1 || true)"
-      [[ -n "$_last_embedded" ]] && _want_date="${_last_embedded#_}"
+      # Only a VALID embedded calendar date counts as a realign target. A
+      # non-date 8-digit run (resolution/serial) must NOT re-date an existing,
+      # correct first-sighting stamp to a bogus year (that would force the
+      # backup's early eviction). If no valid embedded date, _want_date stays
+      # empty and we leave the existing stamp alone.
+      local _want_date
+      _want_date="$(_embedded_date "$name")"
 
       if [[ -z "$_want_date" || "$_existing_date" == "$_want_date" ]]; then
         # Either no embedded date to align to, or already aligned.
@@ -194,12 +238,12 @@ generate_checksum() {
   #   2. mtime, formatted YYYYMMDD. Safe fallback for externally-
   #      uploaded files with arbitrary naming schemes.
   local discovery_date="" date_source=""
-  local last_embedded
-  last_embedded="$(echo "$name" | grep -oE '_[0-9]{8}' | tail -1 || true)"
-  if [[ -n "$last_embedded" ]]; then
-    discovery_date="${last_embedded#_}"
+  discovery_date="$(_embedded_date "$name")"
+  if [[ -n "$discovery_date" ]]; then
     date_source="embedded"
   else
+    # No VALID embedded date — fall back to mtime. (A non-date 8-digit run in
+    # the name is intentionally ignored rather than stamped as a bogus date.)
     discovery_date="$(date -r "$file" +%Y%m%d 2>/dev/null || true)"
     date_source="mtime"
   fi
@@ -235,7 +279,12 @@ generate_checksum() {
     fi
 
     if [[ -n "$legacy_source" ]]; then
-      if [[ -s "$legacy_source" ]] && grep -qE '[a-fA-F0-9]{64}' "$legacy_source"; then
+      # Anchor the hex check: a line that is EXACTLY 64 hex chars, optionally
+      # followed by whitespace + filename (standard sha256sum output). The old
+      # unanchored '[a-fA-F0-9]{64}' matched any 64-hex substring, so a sha512
+      # digest (128 hex), a prose line, or a 64-hex filename token would be
+      # PROMOTED as a sha256 that can never match -> permanent false-corruption.
+      if [[ -s "$legacy_source" ]] && grep -qE '^[a-fA-F0-9]{64}([[:space:]]|$)' "$legacy_source"; then
         if mv -f "$legacy_source" "$chk_path"; then
           echo "[PROMOTE ${legacy_origin} ${date_source} ${discovery_date}] $name (preserved historical hash)"
           return
@@ -275,9 +324,10 @@ echo "Scanning $TARGET_DIR for legacy archives..."
 
 # Scan for all supported archive types used in your main script
 find "$TARGET_DIR" \
-  -path "$TARGET_DIR/${CHECKSUM_DIR}" -prune -o \
+  -type d -name "${CHECKSUM_DIR}" -prune -o \
   -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.sql.gz" -o -name "*.archive.gz" -o -name "*.json" -o -name "*.zip" -o -name "*.7z" -o -name "*.*" \) \
   ! -name "*.sha256" ! -name "*.sha256.tmp.*" ! -name "*_corruption_report.txt" \
+  ! -name "*.part" ! -name "*.partial" ! -name "*.tmp" ! -name "*.tmp.*" \
   -print0 | while IFS= read -r -d '' file; do
     generate_checksum "$file" "$TARGET_DIR"
 done
