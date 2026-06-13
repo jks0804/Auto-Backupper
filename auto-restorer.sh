@@ -179,7 +179,7 @@ log() {
 CLI_CONFIG=""
 prev_arg=""
 for arg in "$@"; do
-	if [[ "$arg" == --config=* ]]; then
+	if [[ "$arg" == --config=* || "$arg" == -c=* ]]; then
 		CLI_CONFIG="${arg#*=}"
 	elif [[ "$prev_arg" == "--config" || "$prev_arg" == "-c" ]]; then
 		CLI_CONFIG="$arg"
@@ -218,7 +218,12 @@ Commands:
     --only PATH               Extract only PATH from the archive (repeatable).
                               Matches tar's selection semantics: a directory
                               name pulls the whole subtree; a file name pulls
-                              just that file. The pre-restore checksum still
+                              just that file. PATH must match the member name as
+                              STORED: systems/ archives store it root-relative
+                              (e.g. mnt/cache/appdata/plex, not appdata/plex),
+                              and FamilyBackups archives prefix it with ./ (e.g.
+                              ./users/docs). Run --inspect ARCHIVE to see exact
+                              member names. The pre-restore checksum still
                               verifies the entire archive — the bytes on disk
                               haven't changed, so partial extraction is safe.
     --stop-docker             Stop Docker before extraction, restart after
@@ -284,10 +289,21 @@ _need_val() {  # $1 = flag name, $2 = next token (pass "${2:-}")
 	fi
 }
 
+# Reject a second, different command flag instead of silently letting the last
+# one win (which would drop the operator's earlier operands — e.g. a --restore
+# that never takes the restore lock).
+_set_mode() {  # $1 = the command being requested
+	if [[ -n "$MODE" && "$MODE" != "$1" ]]; then
+		echo "ERROR: conflicting commands: --$MODE and --$1 (choose one)" >&2
+		exit 1
+	fi
+	MODE="$1"
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--list)
-		MODE="list"
+		_set_mode "list"
 		# Optional pattern follows only if the next arg isn't another flag.
 		if [[ -n "${2:-}" && "${2:0:2}" != "--" && "${2:0:1}" != "-" ]]; then
 			LIST_PATTERN="$2"
@@ -295,26 +311,26 @@ while [[ $# -gt 0 ]]; do
 		fi
 		;;
 	--inspect)
-		MODE="inspect"
+		_set_mode "inspect"
 		_need_val "--inspect" "${2:-}"
 		ARCHIVE="$2"
 		shift
 		;;
 	--verify)
-		MODE="verify"
+		_set_mode "verify"
 		_need_val "--verify" "${2:-}"
 		ARCHIVE="$2"
 		shift
 		;;
-	--verify-all) MODE="verify-all" ;;
-	--corruption-report) MODE="corruption-report" ;;
+	--verify-all) _set_mode "verify-all" ;;
+	--corruption-report) _set_mode "corruption-report" ;;
 	--host)
 		_need_val "--host" "${2:-}"
 		HOST_OVERRIDE="$2"
 		shift
 		;;
 	--restore)
-		MODE="restore"
+		_set_mode "restore"
 		_need_val "--restore" "${2:-}"
 		ARCHIVE="$2"
 		shift
@@ -333,15 +349,18 @@ while [[ $# -gt 0 ]]; do
 	--force) FORCE="true" ;;
 	--no-verify) VERIFY_BEFORE_RESTORE="false" ;;
 	--dry-run) DRY_RUN="true" ;;
-	--prune-checksums) MODE="prune-checksums" ;;
+	--prune-checksums) _set_mode "prune-checksums" ;;
 	--older-than)
 		_need_val "--older-than" "${2:-}"
 		PRUNE_OLDER_THAN="$2"
 		shift
 		;;
 	--commit) PRUNE_COMMIT="true" ;;
-	--config=*) ;;                       # already captured
-	--config | -c) shift ;;              # consume value
+	--config=* | -c=*) ;;                # already captured by the pre-pass
+	--config | -c)
+		_need_val "$1" "${2:-}"
+		shift
+		;;
 	-h | --help) usage; exit 0 ;;
 	*)
 		echo "ERROR: Unknown argument: $1" >&2
@@ -364,12 +383,12 @@ fi
 # Parse a duration string like "5y", "12m", "365d" into a cutoff date
 # (YYYYMMDD) representing "today minus that duration". Echoes the
 # cutoff on stdout; returns non-zero (and emits nothing) if the input
-# doesn't match the strict Nd / Nm / Ny grammar. Month and year are
-# approximate (30 / 365 days) — fine for retention math, which is
-# already operating in day-resolution units.
+# doesn't match the strict Nd / Nm / Ny grammar. Months and years use GNU
+# date calendar arithmetic, so the cutoff honours real month lengths and
+# leap days (e.g. 12m == 1y, and 1y is exactly one calendar year back).
 parse_duration_to_cutoff() {
 	local input="$1"
-	local n unit days
+	local n unit
 	if [[ "$input" =~ ^([0-9]+)([dmy])$ ]]; then
 		n="${BASH_REMATCH[1]}"
 		unit="${BASH_REMATCH[2]}"
@@ -377,11 +396,10 @@ parse_duration_to_cutoff() {
 		return 1
 	fi
 	case "$unit" in
-		d) days="$n" ;;
-		m) days=$((n * 30)) ;;
-		y) days=$((n * 365)) ;;
+		d) date -d "${n} days ago"   +%Y%m%d 2>/dev/null ;;
+		m) date -d "${n} months ago" +%Y%m%d 2>/dev/null ;;
+		y) date -d "${n} years ago"  +%Y%m%d 2>/dev/null ;;
 	esac
-	date -d "${days} days ago" +%Y%m%d 2>/dev/null
 }
 
 # Format byte count as human-readable with an appropriate unit.
@@ -859,6 +877,11 @@ cmd_verify() {
 	HASH_ERROR)  log "  FAIL: Could not hash $archive (timeout or I/O error)${chronic_tag}" ;;
 	NO_BASE)     log "  WARN: $archive is not under BACKUP_BASE; no checksum resolvable" ;;
 	esac
+	# A not-yet-scanned archive (NO_CHECKSUM) or one outside BACKUP_BASE
+	# (NO_BASE) is a warning, not a failure — match cmd_verify_all's policy so
+	# `--verify FILE || alert` does not false-alarm on a benign just-made
+	# backup. MISMATCH(1)/HASH_ERROR(4) still propagate as failures.
+	case "$status" in NO_CHECKSUM | NO_BASE) rc=0 ;; esac
 	return "$rc"
 }
 
@@ -1325,6 +1348,11 @@ cmd_prune_checksums() {
 		local rel_with_suffix="${chk#"${BACKUP_BASE}/${CHECKSUM_DIR}/"}"
 		local data_rel="${rel_with_suffix%_${date_suffix}.sha256}"
 		[[ -f "${BACKUP_BASE}/${data_rel}" ]] && continue
+		# A legacy un-dated checksum is "<dataname>.sha256"; if <dataname> itself
+		# ends in _<8digits> (e.g. data file "report_20231231"), the suffix regex
+		# above mis-reads it as dated. Also honour the un-dated reading so a
+		# present data file is never classified as an orphan.
+		[[ -f "${BACKUP_BASE}/${rel_with_suffix%.sha256}" ]] && continue
 		printf '%s\n' "$chk" >>"$list_file"
 		candidates_count=$((candidates_count + 1))
 	done < <(find "${BACKUP_BASE}/${CHECKSUM_DIR}" -type f -name "*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].sha256" -print0 2>/dev/null)
@@ -1373,8 +1401,11 @@ cmd_prune_checksums() {
 			date_suffix="${BASH_REMATCH[1]}"
 			rel_with_suffix="${chk#"${BACKUP_BASE}/${CHECKSUM_DIR}/"}"
 			data_rel="${rel_with_suffix%_${date_suffix}.sha256}"
-			if [[ -f "${BACKUP_BASE}/${data_rel}" ]]; then
-				log "SKIP (data file reappeared since scan): $chk"
+			# Skip if EITHER the dated reading's data file is present (TOCTOU
+			# reappearance) OR the un-dated reading's data file is present (a
+			# legacy "<name>_<8digits>.sha256" whose data is "<name>_<8digits>").
+			if [[ -f "${BACKUP_BASE}/${data_rel}" || -f "${BACKUP_BASE}/${rel_with_suffix%.sha256}" ]]; then
+				log "SKIP (data file present, keeping checksum): $chk"
 				skipped_reappeared=$((skipped_reappeared + 1))
 				continue
 			fi
@@ -1400,6 +1431,20 @@ cmd_prune_checksums() {
 # are read-only and safely concurrent with a scheduled backup.
 case "$MODE" in
 restore)
+	# Serialize against the backup worker too: it holds
+	# /var/lock/auto_backupper.lock for its whole run, including the rotation
+	# phase that rm's aged archives. Without this a restore could read an
+	# archive the worker deletes mid-extraction (an operator-initiated restore
+	# is not covered by the cross-host "schedules never overlap" guarantee).
+	# Open with <> so we never truncate the worker's lockfile, and hold the FD
+	# for the restore's lifetime so rotation cannot run concurrently.
+	RESTORE_WORKER_LOCK_WAIT="${RESTORE_WORKER_LOCK_WAIT:-30}"
+	[[ "$RESTORE_WORKER_LOCK_WAIT" =~ ^[0-9]+$ ]] || RESTORE_WORKER_LOCK_WAIT=30
+	exec 201<>"/var/lock/auto_backupper.lock"
+	if ! flock -w "$RESTORE_WORKER_LOCK_WAIT" 201; then
+		echo "ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first." >&2
+		exit 1
+	fi
 	exec 200>"$LOCKFILE"
 	if ! flock -n 200; then
 		echo "ERROR: Another auto-restorer restore is already running (lockfile held)." >&2

@@ -188,7 +188,7 @@ Read-only exploration and one-shot restores against the backup set produced by t
 # Useful when you just need one file or subtree back rather than the whole archive.
 ./auto-restorer.sh --restore /mnt/user/backup/systems/host/host_20260118.tar.gz \
                    --target /tmp/restore \
-                   --only appdata/plex \
+                   --only mnt/cache/appdata/plex \
                    --only boot/config/syslinux.cfg
 
 # Preview which orphan checksums would be deleted if pruned (dry-run is default)
@@ -203,11 +203,14 @@ Read-only exploration and one-shot restores against the backup set produced by t
 
 ### Partial Restore (`--only PATH`)
 
-When you only need a subset of an archive (a single file, one subtree, a specific config), pass `--only PATH` one or more times to `--restore`. Each value is forwarded verbatim to tar's MEMBERS selection:
+When you only need a subset of an archive (a single file, one subtree, a specific config), pass `--only PATH` one or more times to `--restore`. Each value is forwarded verbatim to tar's MEMBERS selection, so it must match the member name **as stored in the archive** — which depends on how that archive was built:
 
--   `--only myshare/data.txt` extracts just that one file.
--   `--only appdata/plex` extracts the whole `appdata/plex/` subtree.
+-   **`shares/` archives** store members under the share name: `--only myshare/data.txt`.
+-   **`systems/` archives** are tarred with `-C /`, so members are root-relative *without* the leading slash — use `--only mnt/cache/appdata/plex` (not `appdata/plex`) and `--only boot/config/syslinux.cfg`.
+-   **`shares/FamilyBackups/` archives** are tarred from the member directory with a `.` root, so every member carries a leading `./` — use `--only ./users/docs` (not `users/docs`).
 -   Multiple `--only` flags combine — all matched paths are extracted in one tar pass.
+
+When unsure of the exact prefix, run `--inspect ARCHIVE` first to list the members, then copy them into `--only`.
 
 The restore plan shows the partial list in a `Only paths:` row and the preview reflects the filter (first 10 entries matching `--only`, not first 10 of the whole archive). **Pre-restore checksum still verifies the entire archive** because the bytes on disk haven't changed — partial extraction is safe against the same integrity guarantee as a full restore. If `--only` names a path that doesn't exist in the archive, tar exits non-zero and the restorer surfaces a clear `Extraction failed` log line.
 
