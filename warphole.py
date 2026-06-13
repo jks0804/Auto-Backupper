@@ -104,6 +104,7 @@ state = {
     "sid": "",
     "keep_local": False,
     "manage_mount": True,
+    "we_mounted": False,  # True only once THIS process performs the mount
     "mode": "",
     "lock_fd": None,
     "log_to_file": True,  # false in stats mode (dashboard output is not logged)
@@ -478,6 +479,7 @@ def mount_smb():
         _safe_remove(creds)
 
     if rc.returncode == 0:
+        state["we_mounted"] = True
         log("SUCCESS: Share mounted.")
     else:
         # Log the exit code only — mount.cifs error text can echo the temporary
@@ -931,9 +933,20 @@ def run_health_check():
                 open(CONFIG["REPAIR_MARKER"], "w").close()
             except OSError:
                 pass
-            if subprocess.run(["/sbin/reboot"]).returncode != 0:
-                if subprocess.run(["systemctl", "reboot"]).returncode != 0:
-                    log("FATAL: Could not trigger reboot.")
+            # Mirror the bash `/sbin/reboot || systemctl reboot || FATAL`
+            # chain: a missing binary must fall through to the next attempt,
+            # but subprocess.run raises FileNotFoundError (not a non-zero rc),
+            # so catch OSError per attempt instead of testing returncode alone.
+            rebooted = False
+            for cmd in (["/sbin/reboot"], ["systemctl", "reboot"]):
+                try:
+                    if subprocess.run(cmd).returncode == 0:
+                        rebooted = True
+                        break
+                except OSError:
+                    continue
+            if not rebooted:
+                log("FATAL: Could not trigger reboot.")
             sys.exit(0)
         else:
             log("WARNING: Skipping repair (bare-metal with sufficient RAM — reboot heuristic doesn't apply).")
@@ -1206,8 +1219,11 @@ def cleanup():
     if os.path.isdir(CONFIG["TEMP_DIR"]) and not state["keep_local"]:
         shutil.rmtree(CONFIG["TEMP_DIR"], ignore_errors=True)
 
-    # Auto-unmount (only if we manage the mount).
-    if CONFIG["DESTINATION_TYPE"] == "smb" and state["manage_mount"]:
+    # Auto-unmount only a mount THIS process created — never a pre-existing,
+    # foreign, or concurrently-mounted share. Without the we_mounted guard a
+    # second instance that exits on the held lock (atexit -> cleanup) would
+    # unmount the share the first, still-running instance mounted.
+    if CONFIG["DESTINATION_TYPE"] == "smb" and state["manage_mount"] and state["we_mounted"]:
         if os.path.ismount(CONFIG["MOUNT_POINT"]):
             if state["mode"] != "stats":
                 log("Cleanup: Unmounting share...")
