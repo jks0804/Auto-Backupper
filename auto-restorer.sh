@@ -271,6 +271,19 @@ if [[ $# -eq 0 ]]; then
 	exit 1
 fi
 
+# Require a value for a flag: reject BOTH a missing next token AND a flag-shaped
+# one (begins with '-'). The old guards only checked emptiness, so e.g.
+# `--target --stop-docker` silently swallowed --stop-docker as the target value,
+# dropped the real flag, and (with --force skipping confirmation) extracted to a
+# CWD dir literally named "--stop-docker". A backup path/duration/hostname never
+# legitimately begins with '-', so rejecting it is safe.
+_need_val() {  # $1 = flag name, $2 = next token (pass "${2:-}")
+	if [[ -z "$2" || "$2" == -* ]]; then
+		echo "ERROR: $1 requires a value (got '${2:-<none>}')" >&2
+		exit 1
+	fi
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--list)
@@ -283,36 +296,36 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--inspect)
 		MODE="inspect"
-		[[ -z "${2:-}" ]] && { echo "ERROR: --inspect requires an archive path" >&2; exit 1; }
+		_need_val "--inspect" "${2:-}"
 		ARCHIVE="$2"
 		shift
 		;;
 	--verify)
 		MODE="verify"
-		[[ -z "${2:-}" ]] && { echo "ERROR: --verify requires an archive path" >&2; exit 1; }
+		_need_val "--verify" "${2:-}"
 		ARCHIVE="$2"
 		shift
 		;;
 	--verify-all) MODE="verify-all" ;;
 	--corruption-report) MODE="corruption-report" ;;
 	--host)
-		[[ -z "${2:-}" ]] && { echo "ERROR: --host requires a hostname" >&2; exit 1; }
+		_need_val "--host" "${2:-}"
 		HOST_OVERRIDE="$2"
 		shift
 		;;
 	--restore)
 		MODE="restore"
-		[[ -z "${2:-}" ]] && { echo "ERROR: --restore requires an archive path" >&2; exit 1; }
+		_need_val "--restore" "${2:-}"
 		ARCHIVE="$2"
 		shift
 		;;
 	--target)
-		[[ -z "${2:-}" ]] && { echo "ERROR: --target requires a path" >&2; exit 1; }
+		_need_val "--target" "${2:-}"
 		TARGET="$2"
 		shift
 		;;
 	--only)
-		[[ -z "${2:-}" ]] && { echo "ERROR: --only requires a path inside the archive" >&2; exit 1; }
+		_need_val "--only" "${2:-}"
 		ONLY_PATHS+=("$2")
 		shift
 		;;
@@ -322,7 +335,7 @@ while [[ $# -gt 0 ]]; do
 	--dry-run) DRY_RUN="true" ;;
 	--prune-checksums) MODE="prune-checksums" ;;
 	--older-than)
-		[[ -z "${2:-}" ]] && { echo "ERROR: --older-than requires a duration (e.g. 5y, 12m, 365d)" >&2; exit 1; }
+		_need_val "--older-than" "${2:-}"
 		PRUNE_OLDER_THAN="$2"
 		shift
 		;;
@@ -995,7 +1008,7 @@ cmd_restore() {
 		log "Target directory does not exist: $target"
 		if [[ "$DRY_RUN" != "true" ]]; then
 			if confirm "Create it?"; then
-				mkdir -p "$target" || {
+				mkdir -p -- "$target" || {
 					log "FATAL: Could not create $target"
 					return 1
 				}
@@ -1103,13 +1116,13 @@ cmd_restore() {
 		# extracts the full archive.
 		if [[ -n "$dflag" ]]; then
 			if ((${#ONLY_PATHS[@]} > 0)); then
-				tar "$dflag" -xpf "$archive" -C "$target" --same-owner "${ONLY_PATHS[@]}" || extract_rc=$?
+				tar "$dflag" -xpf "$archive" -C "$target" --same-owner -- "${ONLY_PATHS[@]}" || extract_rc=$?
 			else
 				tar "$dflag" -xpf "$archive" -C "$target" --same-owner || extract_rc=$?
 			fi
 		else
 			if ((${#ONLY_PATHS[@]} > 0)); then
-				tar -xpf "$archive" -C "$target" --same-owner "${ONLY_PATHS[@]}" || extract_rc=$?
+				tar -xpf "$archive" -C "$target" --same-owner -- "${ONLY_PATHS[@]}" || extract_rc=$?
 			else
 				tar -xpf "$archive" -C "$target" --same-owner || extract_rc=$?
 			fi
@@ -1345,14 +1358,33 @@ cmd_prune_checksums() {
 		return 1
 	fi
 
-	local deleted=0
+	local deleted=0 skipped_reappeared=0
 	while IFS= read -r chk; do
 		[[ -z "$chk" ]] && continue
+		# Re-check data-file presence at DELETE time, not just at scan time. The
+		# scan->confirm window can be long (operator reading the prompt) and prune
+		# holds no lock, so watchtower could have re-stamped or a pull re-created
+		# the data file since the scan. Deleting its checksum now would strand a
+		# present-but-unverifiable backup. Re-derive data_rel exactly as the scan
+		# loop does and skip if the data has reappeared.
+		local cbase date_suffix rel_with_suffix data_rel
+		cbase="$(basename "$chk")"
+		if [[ "$cbase" =~ _([0-9]{8})\.sha256$ ]]; then
+			date_suffix="${BASH_REMATCH[1]}"
+			rel_with_suffix="${chk#"${BACKUP_BASE}/${CHECKSUM_DIR}/"}"
+			data_rel="${rel_with_suffix%_${date_suffix}.sha256}"
+			if [[ -f "${BACKUP_BASE}/${data_rel}" ]]; then
+				log "SKIP (data file reappeared since scan): $chk"
+				skipped_reappeared=$((skipped_reappeared + 1))
+				continue
+			fi
+		fi
 		if rm -f "$chk"; then
 			deleted=$((deleted + 1))
 		fi
 	done <"$list_file"
 	log "Deleted ${deleted}/${candidates_count} orphan checksum(s)."
+	[[ $skipped_reappeared -gt 0 ]] && log "Skipped ${skipped_reappeared} whose data file reappeared since the scan (kept their checksum)."
 	rm -f "$list_file"
 
 	# Tidy now-empty subdirs under .checksums/ (but never the root).
