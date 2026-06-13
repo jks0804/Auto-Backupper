@@ -95,6 +95,18 @@ LOG_VERBOSITY="info"
 UPDATE_SCHEDULER_ENABLE=false
 DOCKER_UPDATE_EXCLUDE="mariadb"
 
+# Scheduler timing defaults. *_ENABLE gates each job, but MODE/VALUE/TIME had no
+# in-script default — an enabled-but-incomplete config (or an older cfg that only
+# set *_ENABLE) made the should_run_schedule call dereference an unset var under
+# set -u. The error fires inside the $() subshell so the daemon survives, but the
+# job then NEVER fires and the log fills with 'unbound variable'. Defaulting them
+# here (before the config is sourced, so the cfg still overrides) makes an enabled
+# schedule run on sane values instead of silently never firing.
+BACKUP_SCHEDULER_MODE="monthly";  BACKUP_SCHEDULER_VALUE="1";   BACKUP_SCHEDULER_TIME="02:00"
+CLEANUP_SCHEDULER_MODE="daily";   CLEANUP_SCHEDULER_VALUE="Sun"; CLEANUP_SCHEDULER_TIME="04:00"
+VERIFY_SCHEDULER_MODE="monthly";  VERIFY_SCHEDULER_VALUE="15";  VERIFY_SCHEDULER_TIME="03:00"
+UPDATE_SCHEDULER_MODE="weekly";   UPDATE_SCHEDULER_VALUE="Sun"; UPDATE_SCHEDULER_TIME="05:00"
+
 # Defaults for Docker Container Recovery (Unraid ghost-container repair)
 DOCKER_RECOVERY_ENABLE=false
 DOCKER_RECOVERY_RUN_ON_STARTUP=true
@@ -339,6 +351,11 @@ atomic_write() {
 # Wakes up every 3 seconds to check for triggers.
 smart_sleep() {
 	local duration="${1:-300}"
+	# Validate numeric. A non-numeric MONITOR_INTERVAL ("5 min") would otherwise
+	# either kill the daemon (unbound-var in the $((current_ts + duration))
+	# arithmetic under set -u) or busy-spin it (a bare "5m" fails the arithmetic,
+	# leaving wake_time=0 so the loop never sleeps and pegs a CPU).
+	[[ "$duration" =~ ^[0-9]+$ ]] || duration=300
 	local current_ts
 	current_ts=$(date +%s)
 	local wake_time=$((current_ts + duration))
@@ -1685,13 +1702,31 @@ check_manual_triggers() {
 	if [[ -f "$TRIGGER_CONFIG" ]]; then
 		local new_cfg
 		new_cfg=$(cat "$TRIGGER_CONFIG")
-		if [[ -f "$new_cfg" ]]; then
+		rm -f "$TRIGGER_CONFIG"
+		if [[ -n "$new_cfg" && -f "$new_cfg" ]]; then
 			log "CONFIG: Switching config file to: $new_cfg"
 			CFG_TO_LOAD="$new_cfg"
-		else
-			log "ERROR: Requested config $new_cfg not found. Keeping previous."
+		elif [[ -n "$new_cfg" ]]; then
+			log "ERROR: Requested config $new_cfg not found. Reloading current ($CFG_TO_LOAD)."
 		fi
-		rm -f "$TRIGGER_CONFIG"
+		# Actually RE-SOURCE the config. The handler previously only swapped the
+		# CFG_TO_LOAD path variable and never re-read the file, so --reload was a
+		# no-op for every tunable (MONITOR_INTERVAL, schedules, thresholds, …) —
+		# they kept their boot values until a full restart. Syntax-check first so
+		# a malformed cfg logs an error instead of injecting a partial/garbled state.
+		if [[ -f "$CFG_TO_LOAD" ]]; then
+			if bash -n "$CFG_TO_LOAD" 2>/dev/null; then
+				# shellcheck disable=SC1090
+				source "$CFG_TO_LOAD"
+				# Re-derive config-dependent vars so they track the reloaded values.
+				CORRUPTION_REPORT="${WATCH_DIR}/${CHECKSUM_DIR}/${HOSTNAME_VAR}_corruption_report.txt"
+				log "CONFIG: Reloaded $CFG_TO_LOAD (note: a changed WATCHTOWER_LOGFILE needs a daemon restart — the log FD is fixed for the daemon's life)."
+			else
+				log "ERROR: $CFG_TO_LOAD has a syntax error (bash -n failed); NOT reloading. Keeping current config."
+			fi
+		else
+			log "ERROR: Config $CFG_TO_LOAD not found on reload. Keeping current config."
+		fi
 	fi
 
 	# --- 5. Cleanup ---
@@ -3138,7 +3173,11 @@ _hub_daemon_start_inner() {
 	# nohup + & + redirect to /dev/null detaches the child fully. The
 	# daemon's own EXIT trap manages PID file cleanup; nothing for us
 	# to do beyond launching.
-	nohup bash "$0" --monitor >/dev/null 2>&1 &
+	# Pass the active config to the re-exec'd daemon. Without it the daemon
+	# falls back to DEFAULT_CONFIG_FILE, so a hub launched against a custom
+	# --config would silently spawn a daemon monitoring the WRONG WATCH_DIR /
+	# schedules / thresholds. Every other launch site already passes it.
+	nohup bash "$0" "--config=$CFG_TO_LOAD" --monitor >/dev/null 2>&1 &
 	local launched_pid=$!
 	# Disown so the hub doesn't track it as a job (otherwise quitting
 	# the hub could trigger SIGHUP-style cleanup attempts on the daemon).
@@ -3280,7 +3319,10 @@ _hub_stop_backup() {
 	if ! _hub_confirm "Stop running backup?"; then return; fi
 	_HUB_IN_SUBVIEW=1
 	_hub_term_restore
-	bash "$0" --stop-backup
+	# Pass the active config so the child's is_backup_running / BACKUP_PIDFILE
+	# target the same lock/pidfile the hub is driving (a custom-lockfile config
+	# would otherwise make the default-config child a no-op).
+	bash "$0" "--config=$CFG_TO_LOAD" --stop-backup
 	_hub_pause
 	_HUB_IN_SUBVIEW=0
 	_hub_term_init
@@ -3924,9 +3966,19 @@ case "$MODE" in
 		STOP_WAITED=$((STOP_WAITED + 1))
 	done
 	if kill -0 "$TARGET_PID" 2>/dev/null; then
-		echo "Process $TARGET_PID didn't exit after 15s — sending SIGKILL."
-		kill -9 "$TARGET_PID" 2>/dev/null || true
-		send_notify "alert" "Manual Stop" "Backup process SIGKILLed — Docker state may need manual recovery on next run."
+		# Re-check the cmdline before escalating. During the 15s grace the worker
+		# may have exited and the kernel recycled its PID onto an unrelated
+		# process; SIGKILLing that is the wrong-process-kill the initial cmdline
+		# guard exists to prevent. (If /proc/cmdline is unreadable we trust the
+		# PID, same as the SIGTERM path above.)
+		if [[ -r "/proc/$TARGET_PID/cmdline" ]] && ! tr '\0' ' ' <"/proc/$TARGET_PID/cmdline" 2>/dev/null | grep -q -E 'auto[_-]backupper'; then
+			echo "PID $TARGET_PID no longer looks like auto-backupper (exited and PID reused?). NOT sending SIGKILL."
+			send_notify "warning" "Manual Stop" "Backup PID $TARGET_PID vanished/recycled before SIGKILL; not escalating."
+		else
+			echo "Process $TARGET_PID didn't exit after 15s — sending SIGKILL."
+			kill -9 "$TARGET_PID" 2>/dev/null || true
+			send_notify "alert" "Manual Stop" "Backup process SIGKILLed — Docker state may need manual recovery on next run."
+		fi
 	else
 		send_notify "warning" "Manual Stop" "Backup process terminated cleanly by user."
 	fi
