@@ -534,7 +534,10 @@ def trigger_mover():
                 dirs.remove(".abpartial")
             for fn in files:
                 src = os.path.join(root, fn)
-                if file_is_stable(src):
+                # Lighter gate than the scan default (which is 15s min-age +
+                # 3x2s sampling per file — far too slow for a mover walking many
+                # cache files); matches the bash primary's file_is_stable 5 2 1.
+                if file_is_stable(src, min_age=5, samples=2, interval=1):
                     rel = os.path.relpath(src, cache)
                     dest = os.path.join(array, rel)
                     os.makedirs(os.path.dirname(dest), exist_ok=True)

@@ -1035,12 +1035,19 @@ def main():
         # a waiter could win a stale inode while a fresh worker runs
         # unserialized. Open "a+" so we never truncate the worker's file, and
         # keep the FD for the restore's lifetime so a backup can't start.
-        _worker_lock_fd = open("/var/lock/auto_backupper.lock", "a+")
         try:
-            fcntl.flock(_worker_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _worker_lock_fd = open("/var/lock/auto_backupper.lock", "a+")
         except OSError:
-            print("ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first.", file=sys.stderr)
-            sys.exit(1)
+            # No worker lockfile (e.g. /var/lock absent on a minimal host) means
+            # no worker could be holding it either; proceed without the probe
+            # rather than crashing the restore.
+            _worker_lock_fd = None
+        if _worker_lock_fd is not None:
+            try:
+                fcntl.flock(_worker_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first.", file=sys.stderr)
+                sys.exit(1)
 
         # Open without truncating ("a+") so the previous PID stays readable
         # until we hold the lock; only then truncate + write our PID. Avoids the
