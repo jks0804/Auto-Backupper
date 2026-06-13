@@ -38,9 +38,12 @@ import subprocess
 CHECKSUM_DIR = ".checksums"
 LOCKFILE = "/var/lock/auto_backupper.lock"
 
-# Archive name patterns the scan accepts. The bash uses `-name "*.*"` as a
-# catch-all, so in practice any file with a dot (that isn't a checksum / temp /
-# corruption-report file) qualifies.
+# Only real archive types are stamped (matches the bash find allowlist). The
+# bash original once used a `*.*` catch-all that stamped every dotted file;
+# the allowlist keeps notes.txt / config.yaml / photo.jpeg out of the tree.
+_ARCHIVE_PATTERNS = (
+    "*.tar.gz", "*.tgz", "*.sql.gz", "*.archive.gz", "*.json", "*.zip", "*.7z",
+)
 _EXCLUDE_PATTERNS = (
     "*.sha256", "*.sha256.tmp.*", "*_corruption_report.txt",
     "*.part", "*.partial", "*.tmp", "*.tmp.*",
@@ -52,7 +55,7 @@ _lock_fd = None
 
 def get_chk_dir(file_path, base):
     # Mirror the data tree under base/.checksums/.
-    base = base.rstrip("/")
+    base = base.rstrip("/") or "/"
     rel = file_path[len(base) + 1:] if file_path.startswith(base + "/") else os.path.basename(file_path)
     return os.path.join(base, CHECKSUM_DIR, os.path.dirname(rel))
 
@@ -149,12 +152,12 @@ def generate_checksum(file_path, base, force):
     if force:
         # Sweep every checksum variant (dated + both legacy layouts) so the
         # regen reflects the date we are about to compute.
-        for stale in glob.glob(os.path.join(chk_dir, name + _DATED_GLOB)):
+        for stale in glob.glob(os.path.join(chk_dir, glob.escape(name) + _DATED_GLOB)):
             _safe_remove(stale)
         _safe_remove(legacy_in_dir)
         _safe_remove(legacy_next_to_file)
     else:
-        existing = glob.glob(os.path.join(chk_dir, name + _DATED_GLOB))
+        existing = glob.glob(os.path.join(chk_dir, glob.escape(name) + _DATED_GLOB))
         if len(existing) > 1:
             # Multiple dated siblings — don't guess a winner; flag for --force.
             print(f"[SKIP-MULTI] {name} has {len(existing)} dated siblings — use --force to clean")
@@ -253,7 +256,7 @@ def _sha256(path):
 
 
 def find_archives(base):
-    base = base.rstrip("/")
+    base = base.rstrip("/") or "/"  # "/".rstrip("/") is "", and os.walk("") yields nothing
     chk_root = os.path.join(base, CHECKSUM_DIR)
     out = []
     for root, dirs, files in os.walk(base):
@@ -263,8 +266,9 @@ def find_archives(base):
         if CHECKSUM_DIR in dirs:
             dirs.remove(CHECKSUM_DIR)
         for fn in files:
-            if "." not in fn:
-                continue  # bash `-name "*.*"` requires a dot
+            # Allowlist real archive types instead of every dotted file.
+            if not any(fnmatch.fnmatch(fn, pat) for pat in _ARCHIVE_PATTERNS):
+                continue
             if any(fnmatch.fnmatch(fn, pat) for pat in _EXCLUDE_PATTERNS):
                 continue
             out.append(os.path.join(root, fn))
