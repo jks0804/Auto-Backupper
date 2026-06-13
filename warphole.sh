@@ -143,7 +143,10 @@ if [[ -f "$SECRETS_FILE" ]]; then
 		echo "WARN: $SECRETS_FILE is owned by $_secrets_owner, not root." >&2
 	fi
 	# shellcheck disable=SC1090
-	source "$SECRETS_FILE"
+	if ! source "$SECRETS_FILE"; then
+		echo "FATAL: $SECRETS_FILE failed to load (bash syntax error, or a command in it returned non-zero). Fix or remove it." >&2
+		exit 1
+	fi
 	unset _secrets_perms _secrets_owner
 fi
 
@@ -550,6 +553,10 @@ run_backup() {
 	fi
 
 	# --- 2. Generate Backup ---
+	# Clear staging residue from a crashed run or a prior --keep-local first, so
+	# the bare-metal `find ... -print -quit` selector below cannot pick up a
+	# stale zip and offload it under today's name.
+	rm -rf "$TEMP_DIR"
 	mkdir -p "$TEMP_DIR"
 	log "Phase: Generating Teleporter Archive..."
 
@@ -1051,13 +1058,27 @@ run_health_check() {
 				local RETRY_HDR=()
 				[[ -n "$SID" ]] && RETRY_HDR=(-H "X-FTL-SID: $SID")
 
-				local RETRY_STATS RETRY_COUNT=0
-				# WD3: set -e guard — FTL may still be reloading after the restart.
-				RETRY_STATS=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${RETRY_HDR[@]}") || true
-				if [[ -n "$RETRY_STATS" ]] && echo "$RETRY_STATS" | jq -e 'type=="object"' >/dev/null 2>&1; then
-					RETRY_COUNT=$(echo "$RETRY_STATS" | jq -r '.gravity_size // 0')
-					[[ "$RETRY_COUNT" =~ ^[0-9]+$ ]] || RETRY_COUNT=0
-				fi
+				local RETRY_STATS RETRY_COUNT=0 _probe=0
+				# FTL's REST API can take well over the fixed sleeps above to
+				# reopen its socket after a restart; poll /padd up to ~6 times
+				# instead of a single shot so a slow-but-healthy rebuild is not
+				# misreported as a failure. WD3: every fetch is set -e guarded.
+				while [[ $_probe -lt 6 ]]; do
+					RETRY_STATS=$(curl -s --max-time 10 -X GET "$PI_URL/padd" "${RETRY_HDR[@]}") || true
+					if [[ -n "$RETRY_STATS" ]] && echo "$RETRY_STATS" | jq -e 'type=="object"' >/dev/null 2>&1; then
+						RETRY_COUNT=$(echo "$RETRY_STATS" | jq -r '.gravity_size // 0')
+						[[ "$RETRY_COUNT" =~ ^[0-9]+$ ]] || RETRY_COUNT=0
+						[[ "$RETRY_COUNT" -gt 0 ]] && break
+					fi
+					_probe=$((_probe + 1))
+					[[ $_probe -lt 6 ]] || break
+					sleep 5
+					# Re-auth: the SID may not have been valid on the early probes.
+					SID=""
+					authenticate
+					RETRY_HDR=()
+					[[ -n "$SID" ]] && RETRY_HDR=(-H "X-FTL-SID: $SID")
+				done
 
 				if [[ "$RETRY_COUNT" -gt 0 ]]; then
 					log "RECOVERY: Container restart + gravity rebuild succeeded ($RETRY_COUNT domains active)."
@@ -1097,8 +1118,11 @@ draw_bar() {
 	local color=$3
 
 	local filled
-	# Use awk to calculate width and handle capping > 100% (No bc required)
-	filled=$(awk -v p="$pct" -v w="$width" 'BEGIN { if(p>100) p=100; printf "%.0f", (p/100)*w }')
+	# Use awk to calculate width and handle capping > 100% (No bc required).
+	# `p=p+0` forces numeric context so a non-numeric/null percent becomes 0
+	# (a bare string compares to 100 lexically and would render a full bar);
+	# the <0 clamp keeps a negative-derived value from underflowing `empty`.
+	filled=$(awk -v p="$pct" -v w="$width" 'BEGIN { p=p+0; if(p<0)p=0; if(p>100)p=100; printf "%.0f", (p/100)*w }')
 
 	local empty=$((width - filled))
 
@@ -1144,6 +1168,15 @@ run_stats() {
 		echo "WARN: REFRESH_RATE='$REFRESH_RATE' is not a positive integer, defaulting to 2."
 		REFRESH_RATE=2
 		sleep 2
+	fi
+
+	# The dashboard paces itself with `read -t` on keypresses and uses
+	# `tput cols`; both need an interactive terminal. With stdin not a TTY
+	# (cron, systemd, a pipe, `</dev/null`) `read -t` returns instantly, so the
+	# `while true` loop would busy-spin at full CPU and hammer the PADD API.
+	if ! [[ -t 0 ]]; then
+		echo "FATAL: --stats requires an interactive terminal (stdin is not a TTY)." >&2
+		exit 1
 	fi
 
 	# Setup Terminal
@@ -1195,6 +1228,7 @@ run_stats() {
 		# > Network & Blocking
 		local TOTAL_QUERIES BLOCKED_COUNT PERCENT_BLOCKED DOMAINS_IN_GRAVITY CLIENTS
 		TOTAL_QUERIES=$(echo "$JSON" | jq -r '.queries.total // 0')
+		TOTAL_QUERIES=${TOTAL_QUERIES%.*}; [[ "$TOTAL_QUERIES" =~ ^[0-9]+$ ]] || TOTAL_QUERIES=0
 		BLOCKED_COUNT=$(echo "$JSON" | jq -r '.queries.blocked // 0')
 		PERCENT_BLOCKED=$(echo "$JSON" | jq -r '.queries.percent_blocked // 0')
 		DOMAINS_IN_GRAVITY=$(echo "$JSON" | jq -r '.gravity_size // 0')
@@ -1213,6 +1247,10 @@ run_stats() {
 		# Schema: system.memory.ram.used (KB)
 		MEM_USED_KB=$(echo "$JSON" | jq -r '.system.memory.ram.used // 0')
 		MEM_TOTAL_KB=$(echo "$JSON" | jq -r '.system.memory.ram.total // 0')
+		# PADD can report RAM as fractional KB; the MEM_*_MB integer arithmetic
+		# below errors on a non-integer, so truncate to a whole number.
+		MEM_USED_KB=${MEM_USED_KB%.*};  [[ "$MEM_USED_KB" =~ ^[0-9]+$ ]] || MEM_USED_KB=0
+		MEM_TOTAL_KB=${MEM_TOTAL_KB%.*}; [[ "$MEM_TOTAL_KB" =~ ^[0-9]+$ ]] || MEM_TOTAL_KB=0
 		MEM_PCT=$(echo "$JSON" | jq -r '.system.memory.ram["%used"] // 0')
 		# Schema: sensors.cpu_temp
 		CPU_TEMP=$(echo "$JSON" | jq -r '.sensors.cpu_temp // 0')
@@ -1363,7 +1401,7 @@ else
 			exit 0
 			;;
 		--unmount-only)
-			if mountpoint -q "$MOUNT_POINT"; then umount "$MOUNT_POINT"; fi
+			if mountpoint -q "$MOUNT_POINT"; then umount "$MOUNT_POINT" || umount -l "$MOUNT_POINT" || true; fi
 			exit 0
 			;;
 		--keep-local) KEEP_LOCAL=true ;;
