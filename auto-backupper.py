@@ -98,6 +98,7 @@ CONFIG = {
 
     # --- Paths ---
     "BACKUP_BASE": "/mnt/user/backup",
+    "CHECKSUM_DIR": ".checksums",  # synced to the module global after config load
     "SHARES_BASE_FOLDER": "/mnt/user",
     "SYSTEM_APPDATA_PATH": "/mnt/cache/appdata",
     "SYSTEM_BOOT_PATH": "/boot",
@@ -551,6 +552,14 @@ def _cfg_int(key, default):
         return default
 
 
+def _cfg_float(key, default):
+    # Float counterpart of _cfg_int for ratio-style config values.
+    try:
+        return float(str(CONFIG[key]).strip())
+    except (KeyError, ValueError, TypeError):
+        return default
+
+
 def sys_docker_stop():
     mode = CONFIG["DOCKER_MODE"]
     if mode == "unraid_service":
@@ -903,7 +912,7 @@ def rotation_date_for(file_path, base):
 
 
 def rotation_phase():
-    days = int(CONFIG.get("ROTATE_DAYS", "0") or 0)
+    days = _cfg_int("ROTATE_DAYS", 0)
     if days <= 0:
         return
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
@@ -1050,8 +1059,8 @@ def preflight_free_space_check():
     except OSError:
         pass
 
-    ratio = float(CONFIG.get("PREFLIGHT_COMPRESSION_RATIO", "0.4"))
-    margin = int(CONFIG.get("PREFLIGHT_MARGIN_BYTES", str(1073741824)))
+    ratio = _cfg_float("PREFLIGHT_COMPRESSION_RATIO", 0.4)
+    margin = _cfg_int("PREFLIGHT_MARGIN_BYTES", 1073741824)
     required = int(total * ratio + margin)
     g = 1073741824
     log(f"  Source total (uncompressed): {total / g:.1f} GiB across {len(sources)} path(s)")
@@ -1482,7 +1491,7 @@ def pull_flow():
 
         # Per-folder exclude lists from the REMOTE's dated checksums older than cutoff.
         folder_excludes = {}
-        days = int(CONFIG.get("ROTATE_DAYS", "0") or 0)
+        days = _cfg_int("ROTATE_DAYS", 0)
         remote_chk = os.path.join(active, CHECKSUM_DIR)
         if days > 0 and os.path.isdir(remote_chk):
             cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
@@ -1584,7 +1593,8 @@ def _verify_pull(folders, base, active, threads, marker_ctime):
         log("Pull Verification Successful.")
         return
 
-    log(f"Corruption detected: {len(failed)} file(s). Batch re-pulling from {active}...")
+    log(f"WARN: Corruption detected: {len(failed)} file(s). Batch re-pulling from {active}...")
+    send_notify("warning", "Pull Corruption Detected", f"{len(failed)} file(s) failed verification; re-pulling from {active}.")
     fd, repull = tempfile.mkstemp(prefix="repull_")
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(failed) + "\n")
@@ -1658,7 +1668,10 @@ def parse_args(argv):
             CONFIG["DRY_RUN"] = "true"
         elif a in ("-m", "--mode"):
             i += 1
-            CONFIG["MODE"] = argv[i] if i < len(argv) else CONFIG["MODE"]
+            if i >= len(argv):
+                print("ERROR: --mode requires a value (produce|pull|both)", file=sys.stderr)
+                sys.exit(1)
+            CONFIG["MODE"] = argv[i]
         elif a == "--only":
             i += 1
             if i >= len(argv):
@@ -1717,7 +1730,7 @@ def _redact(s):
 
 
 def main():
-    global LOCK_FD, LOCK_HELD
+    global LOCK_FD, LOCK_HELD, CHECKSUM_DIR
     if os.geteuid() != 0:
         print("CRITICAL: This script must be run as root.", file=sys.stderr)
         sys.exit(1)
@@ -1731,6 +1744,10 @@ def main():
         parse_bash_config(cfg_to_load)
     else:
         log(f"INFO: No config file found at {cfg_to_load}. Using internal defaults.")
+    # Honor a CHECKSUM_DIR override from the cfg (watchtower.py already reads it
+    # via cfg); without this the two tools would write/scan different checksum
+    # trees if an operator changed it. Sync the module-global used everywhere.
+    CHECKSUM_DIR = CONFIG.get("CHECKSUM_DIR", CHECKSUM_DIR)
     CONFIG["BACKUP_BASE"] = CONFIG["BACKUP_BASE"].rstrip("/")
 
     determine_os_and_docker()
