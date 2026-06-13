@@ -74,6 +74,7 @@ _corruption_lock = threading.Lock()
 _sigusr1 = False              # set by the daemon SIGUSR1 handler
 _stop_requested = False       # a SIGTERM/SIGINT arrived during a critical section
 _critical_depth = 0           # >0 while a destructive op (docker update) is in flight
+_critical_lock = threading.Lock()  # guards _critical_depth across the scheduler worker thread
 
 # ==============================================================================
 # 2. CONFIGURATION DEFAULTS (matches watchtower.sh; cfg overrides)
@@ -87,6 +88,7 @@ CONFIG = {
     "MAIN_BACKUP_SCRIPT": "/usr/local/bin/auto_backupper.sh",
     "MAIN_RESTORER_SCRIPT": "",  # auto-located by --hub if empty
     "MONITOR_INTERVAL": "300",
+    "DAEMON_SHUTDOWN_GRACE": "30",  # seconds to let an in-flight docker op finish on stop
     "WATCHTOWER_GRAPH_REFRESH": "1",  # --ab-graph dashboard refresh (seconds)
     "CPU_THREADS": "1",
     "LOG_VERBOSITY": "info",
@@ -418,6 +420,8 @@ def smart_sleep(duration):
         if _sigusr1:
             _sigusr1 = False
             return
+        if _stop_requested:  # a stop is pending; don't sleep out the interval
+            return
         if any(os.path.isfile(t) for t in ALL_TRIGGERS):
             return
         time.sleep(3)
@@ -639,6 +643,37 @@ def _docker_inspect(name, fmt):
                               capture_output=True, text=True).stdout.strip()
     except Exception:
         return ""
+
+
+def _critical(fn):
+    # Mark a destructive op (docker update/recreate) as a critical section so a
+    # stop signal arriving mid-op is deferred (see _daemon_shutdown_handler)
+    # until it finishes — a hub/CLI stop must not orphan a container between
+    # `docker rm` and recreate. The process exit is owned by monitor_loop, NOT
+    # this wrapper: the op may run on a scheduler worker thread, where sys.exit
+    # would only end that thread, not the daemon.
+    def wrapper(*args, **kwargs):
+        global _critical_depth
+        with _critical_lock:
+            _critical_depth += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            with _critical_lock:
+                _critical_depth -= 1
+    return wrapper
+
+
+def _daemon_shutdown_handler(signum, frame):
+    # Runs on the main thread. Exit immediately when idle; if a destructive op
+    # is in flight, set a flag and return so it can finish (monitor_loop exits
+    # once _critical_depth hits 0). A SECOND stop signal forces an exit.
+    global _stop_requested
+    if _critical_depth > 0 and not _stop_requested:
+        _stop_requested = True
+        log("SHUTDOWN: Stop during a critical op; will exit when it finishes (signal again to force).")
+        return
+    sys.exit(0)
 
 
 @_critical
@@ -1185,35 +1220,6 @@ def _daemon_signal_handler(signum, frame):
     log("EVENT: Signal received. Interrupting sleep cycle...")
 
 
-def _critical(fn):
-    # Mark a destructive op (docker update/recreate) as a critical section: a
-    # stop signal that arrives mid-op is deferred (see _daemon_shutdown_handler)
-    # until the op finishes, so a hub/CLI stop can't orphan a container between
-    # `docker rm` and recreate. After it completes, honor any deferred stop.
-    def wrapper(*args, **kwargs):
-        global _critical_depth
-        _critical_depth += 1
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            _critical_depth -= 1
-            if _critical_depth == 0 and _stop_requested:
-                log("SHUTDOWN: Critical section complete; honoring deferred stop.")
-                sys.exit(0)
-    return wrapper
-
-
-def _daemon_shutdown_handler(signum, frame):
-    # Exit immediately when idle; if a critical section is in flight, defer the
-    # exit (the hub/CLI waits DAEMON_SHUTDOWN_GRACE+5s before escalating).
-    global _stop_requested
-    if _critical_depth > 0:
-        _stop_requested = True
-        log("SHUTDOWN: Stop signal during a critical section; deferring until it completes.")
-        return
-    sys.exit(0)
-
-
 def _parse_mode(argv):
     global CLI_CONFIG, CFG_TO_LOAD
     mode = f"--{cfg('STARTUP_MODE')}"
@@ -1256,6 +1262,14 @@ def monitor_loop():
     interval = cfg_int("MONITOR_INTERVAL", 300)
     was_paused = False
     while True:
+        if _stop_requested:
+            # A stop was deferred while a destructive op was in flight. Don't
+            # start new work; wait (bounded) for the op to finish, then exit.
+            deadline = time.time() + cfg_int("DAEMON_SHUTDOWN_GRACE", 30)
+            while _critical_depth > 0 and time.time() < deadline:
+                time.sleep(0.5)
+            log("SHUTDOWN: Daemon stopping.")
+            sys.exit(0)
         check_manual_triggers()
         check_backup_scheduler()
         check_cleanup_scheduler()
