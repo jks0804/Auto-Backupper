@@ -81,6 +81,9 @@ TAILSCALE_PING_IP="100.x.y.z" # A highly available Tailscale IP to ping (e.g., y
 # --- API Settings (Tars & Warp-Core) ---
 PI_URL="http://127.0.0.1/api"
 # WC5: PI_PASSWORD also comes from secrets.env. Empty = no password set on the Pi-hole.
+# Use SINGLE quotes if the password contains $, `, \ or " — inside double quotes
+# bash expands/mangles those before the value is ever sent, and FTL then rejects the
+# truncated string as "password incorrect" with nothing pointing at the real cause.
 PI_PASSWORD=""
 REFRESH_RATE=2 # Dashboard refresh rate in seconds
 
@@ -123,8 +126,8 @@ SID=""
 #
 # Typical contents:
 #   SMB_USER="warphole"
-#   SMB_PASS="long-random-string"
-#   PI_PASSWORD="another-long-random-string"
+#   SMB_PASS='long-random-string'
+#   PI_PASSWORD='another-long-random-string'   # single-quote secrets containing $ ` \ "
 #   # Optionally override share/host if the defaults don't fit your setup:
 #   # SMB_HOST="nas.lan"
 #   # SMB_SHARE="backups"
@@ -395,17 +398,35 @@ authenticate() {
 
 	SID=$(echo "$AUTH_RESPONSE" | jq -r '.session.sid // empty' 2>/dev/null || echo "")
 
-	if [[ -z "$SID" ]]; then
-		local MSG=""
-		MSG=$(echo "$AUTH_RESPONSE" | jq -r '.session.message // empty' 2>/dev/null || echo "")
-		if [[ "$MSG" != *"no password set"* ]]; then
-			# Only fatal if not in stats mode
-			if [[ "$MODE" != "stats" ]]; then
-				log "Auth Failed: $MSG"
-				exit 1
-			fi
-		fi
+	# Got a session token: authenticated.
+	if [[ -n "$SID" ]]; then
+		return 0
 	fi
+
+	# No SID returned. Separate an OPEN API (no password required → proceed
+	# unauthenticated; /padd answers fine) from a REJECTED password (fatal). FTL
+	# sets session.valid=true when the API is open, and that open reply may still
+	# carry sid=null with a message OTHER than the literal "no password set"
+	# (seen in the field: valid=true + "password incorrect" on a box whose password
+	# had been cleared). Decide on session.valid, not the message text — keying off
+	# the message alone turned an open API into a bogus fatal "Auth Failed" for
+	# --check, while --stats silently tolerated it and hid the mismatch.
+	local VALID MSG
+	VALID=$(echo "$AUTH_RESPONSE" | jq -r '.session.valid // empty' 2>/dev/null || echo "")
+	MSG=$(echo "$AUTH_RESPONSE" | jq -r '.session.message // .error.message // empty' 2>/dev/null || echo "")
+
+	if [[ "$VALID" == "true" || "$MSG" == *"no password set"* ]]; then
+		dlog "auth: no session required (valid=$VALID msg='$MSG') — continuing unauthenticated"
+		return 0
+	fi
+
+	# Genuine rejection: wrong password, 2FA/TOTP required, or an error body.
+	# Fatal for the mutating modes; the read-only dashboard tolerates it.
+	if [[ "$MODE" != "stats" ]]; then
+		log "Auth Failed: ${MSG:-unknown (no message in auth response)}"
+		exit 1
+	fi
+	return 0
 }
 
 # SMB Mount Logic
