@@ -1094,3 +1094,38 @@ GAPS:
       bash: Line 62: $(fuser "$LOCKFILE" 2>/dev/null) attempts to show PID of process holding the lock; stderr suppressed if fuser not available or lock not held
       py:   No python port exists.
       loc:  line 62
+
+
+# ===== auto-backupper-client (PARITY INVERSION) =====
+
+NOTE: This component inverts the usual direction of this report. It originated on
+the PYTHON branch (auto-backupper-client.py) and was ported TO bash second, so
+here the PYTHON edition is the broader reference and bash is the follower.
+
+PYTHON (auto-backupper-client.py, python branch): the cross-platform desktop
+backup client. Runs on Windows, macOS, and Linux. Produces FamilyBackups USER +
+SYSTEM archives via stdlib tarfile/hashlib (no tar/sha256sum/rsync dependency),
+delivers to local / SMB-NFS / rsync-SSH, restores locally, installs a native
+scheduler (Task Scheduler / launchd / systemd-timer / cron), and on Windows uses
+a VSS shadow copy for locked files (NTUSER.DAT, browser/Outlook) with skip+warn
+fallback, plus registry/winget/PowerShell system inventory.
+
+BASH (auto-backupper-client.sh, this branch): the Linux/macOS counterpart. Same
+FamilyBackups contract and output format (verified: the suite's auto-restorer
+verifies bash-client archives OK). Uses native tar + sha256sum/shasum + cp/rsync.
+
+VERIFIED GAPS (bash vs python): the inherent platform gap is WINDOWS. Bash does
+not run natively on Windows, so the bash client deliberately omits:
+  - Windows support entirely (VSS shadow copy, registry export via reg.exe,
+    winget/PowerShell inventory, Task Scheduler install). Use the .py client there.
+This is by design, not a TODO: the .py client remains the Windows/universal one.
+
+Feature parity ON Linux/macOS is COMPLETE: --backup users|system|both, all three
+destinations, local restore (full + --only), --verify/--verify-all/--list/
+--inspect, --install-schedule (systemd-timer+cron / launchd), --dry-run,
+SYSTEM_INCOMPLETE manifest marking, server-owned retention + LOCAL_KEEP.
+
+Minor intentional divergences from the .py client (platform-driven, not gaps):
+  - macOS: shasum -a 256 when sha256sum absent; bsdtar (no GNU -S sparse flag);
+    mkdir-based lock instead of flock; Full-Disk-Access probe+warn.
+  - Linux/macOS only have a best-effort open-file copy (no VSS equivalent).

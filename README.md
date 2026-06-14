@@ -50,7 +50,9 @@ Auto-Backupper is a production-grade bash suite designed to automate backups, sy
 | `watchtower.sh` | **The Scheduler/Daemon.** Runs in the background to trigger backups, updates, and maintenance tasks based on schedules. |
 | `warphole.sh` | **The Pi-hole Sidecar.** Teleporter-based Pi-hole backup that writes dated checksums into the same `.checksums/` tree so its output flows into the main sync cycle as a first-class backup. |
 | `legacy-checksum-generatator.sh` | **The Back-Fill Generator.** One-shot tool that adds dated `.sha256` companions to pre-existing archives so legacy trees can join the dated-checksum scheme without re-creating any backups. |
+| `auto-backupper-client.sh` | **The Desktop Client (Linux/macOS).** Runs on family/client machines to produce a USER-data and a SYSTEM-state archive in the `FamilyBackups/<member>/{users,systems}/` layout and deliver them to the server (local drive / mounted SMB-NFS / rsync-over-SSH). Restores locally. Does **not** require root. The cross-platform client — and the only option on Windows — is `auto-backupper-client.py` on the `python` branch. |
 | `auto_backupper.cfg` | **The Brain.** Central configuration file loaded by all scripts. Defines paths, schedules, and retention policies. |
+| `auto_backupper_client.cfg` | **The Client Brain.** Separate config for `auto-backupper-client.sh` (member name, destinations, what to back up, schedule). |
 
 * * * * *
 
@@ -225,6 +227,37 @@ Pick `--target` to match how the archive was built:
 | `shares/FamilyBackups/...` | `PATH/TO/member/sub` |
 | `systems/HOST/*.tar.gz` | `/` (re-extracts appdata, boot, docker.img — **use `--stop-docker`**) |
 | `services/mysql\|mongo\|redis/*.tar.gz` | `/tmp/restore` (then import with mysql/mongorestore/etc.) |
+
+### Desktop Client (`auto-backupper-client.sh`)
+
+Runs on family/client **Linux and macOS** machines (the cross-platform / Windows client is `auto-backupper-client.py` on the `python` branch — bash does not run natively on Windows). It produces two archives per machine — a **USER-data** archive and a **SYSTEM-state** archive — in the suite's exact `FamilyBackups/<member>/{users,systems}/` layout (`./`-rooted `tar.gz` + dated `.checksums/`), then delivers them to one or more destinations. The output drops straight into the server's `BACKUP_BASE`, where `watchtower`/`auto-restorer` treat it as a first-class backup. Configured by a separate `auto_backupper_client.cfg`. It does **not** require root (degrades to the current user's data with warnings).
+
+```
+# Back up users + system and deliver to all configured destinations
+./auto-backupper-client.sh --backup both
+
+# Just user data, simulate only
+./auto-backupper-client.sh --backup users --dry-run
+
+# List / verify reachable archives
+./auto-backupper-client.sh --list
+./auto-backupper-client.sh --verify ARCHIVE   # or --verify-all
+
+# Restore locally (full, or a subtree with the ./-rooted member name)
+./auto-backupper-client.sh --restore ARCHIVE --target /tmp/restore --only ./users/docs
+
+# Register a native schedule (systemd-timer + cron fallback on Linux; launchd on macOS)
+sudo ./auto-backupper-client.sh --install-schedule
+```
+
+| Capability | Behavior |
+| --- | --- |
+| Destinations | `local` (external drive), `share` (SMB/NFS mount), `rsync_ssh` (push over Tailscale/VPN). Configure 1+ in `auto_backupper_client.cfg`; delivery is atomic (data → rename → checksum). `local`/`share` use plain `cp` (no rsync needed); `rsync_ssh` needs `rsync`. |
+| System scope | Config/state to rebuild onto a fresh OS (`/etc` + package lists + services on Linux; `sw_vers`/Homebrew/`defaults` + `/etc` on macOS) — **not** a bootable image. Marked `SYSTEM_INCOMPLETE` in the manifest when captured unprivileged (e.g. `/etc` shadow files skipped). |
+| Retention | The **server** owns retention; the client keeps only `LOCAL_KEEP` local copies. |
+| macOS notes | Uses `shasum -a 256` when `sha256sum` is absent, bsdtar (no `-S`), and a `mkdir`-based lock (no `flock`). Mail/Safari need Full Disk Access (the client probes and warns). |
+
+> **Deployment prerequisite (server side):** the client pushes *finished* archives into `BACKUP_BASE/shares/FamilyBackups/<member>/…`, the same path the server's own FamilyBackups producer writes. For each client-managed member, ensure no raw `SHARES_BASE_FOLDER/FamilyBackups/<member>/` tree exists (the server loop skips absent dirs), **or** remove `"FamilyBackups"` from the server's `SHARES_TO_BACKUP`, so the server never re-tars/overwrites a client-pushed archive.
 
 ### Pruning the Checksum Index
 
