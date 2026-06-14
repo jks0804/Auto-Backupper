@@ -85,6 +85,26 @@ PI_URL="http://127.0.0.1/api"
 # bash expands/mangles those before the value is ever sent, and FTL then rejects the
 # truncated string as "password incorrect" with nothing pointing at the real cause.
 PI_PASSWORD=""
+# WC6: Auth/API timeouts (seconds). FTL's /auth verifies the password with a
+# deliberately-expensive balloon hash. On weak hardware this is SLOW: a Pi Zero
+# (ARMv6) was measured taking ~22s for a single /auth (FTL reports it in the
+# response's "took" field). The default must clear that, or a correct password
+# aborts with curl rc=28 (timeout) and an empty SID — which looks like a failure
+# but isn't. API_CONNECT_TIMEOUT stays small so a genuinely wrong host/port still
+# fails fast instead of masquerading as a slow auth. Override either in secrets.env
+# (raise API_AUTH_TIMEOUT further for an especially loaded/slow box).
+API_CONNECT_TIMEOUT=5
+API_AUTH_TIMEOUT=45
+
+# WC7: Session caching. The /auth hash above is the expensive part; the returned
+# SID is valid for ~30min (response "validity"). Caching it across runs means a
+# cron-driven --check/--backup pays the multi-second hash at most once per window
+# instead of every invocation — a big deal on a Pi Zero. The cache is validated
+# cheaply (a no-hash GET /auth) before reuse and re-authenticates if FTL rejects
+# it (e.g. after an FTL restart). Set SID_CACHE="false" to always authenticate
+# fresh and log out on exit (the pre-WC7 behaviour).
+SID_CACHE="true"
+SID_CACHE_FILE="/tmp/warphole_sid"
 REFRESH_RATE=2 # Dashboard refresh rate in seconds
 
 # --- Debug ---
@@ -315,7 +335,11 @@ cleanup() {
 	fi
 
 	# Clean Auth Session
-	if [[ -n "${SID:-}" ]]; then
+	# WC7: when SID caching is on, do NOT log out — the whole point is to keep
+	# the session alive for the next run to reuse (it expires on its own, and
+	# only one SID is ever cached, so sessions don't pile up). Only the
+	# fresh-auth-every-run mode (SID_CACHE=false) logs out here, as before.
+	if [[ -n "${SID:-}" && "${SID_CACHE:-true}" != "true" ]]; then
 		# WM13: Best-effort logout. If the session is already expired
 		# (e.g. dashboard ran longer than the session TTL), this will
 		# return an error — swallow it silently. Short timeout so a
@@ -372,6 +396,46 @@ check_deps() {
 # error logged. Splitting the pipeline lets us capture curl's rc with
 # `|| auth_rc=$?` and treat network failures as "no SID, continue" so
 # the downstream /padd check (and its -2 [null] detection) still runs.
+# WC7: Load a still-valid cached SID and confirm it with FTL via a cheap,
+# no-hash GET /auth. Sets SID and returns 0 on a usable session; 1 otherwise
+# (missing/expired/rejected — caller then authenticates fresh).
+_load_cached_sid() {
+	[[ -f "$SID_CACHE_FILE" ]] || return 1
+	local cached exp now resp valid
+	IFS=$'\t' read -r cached exp <"$SID_CACHE_FILE" 2>/dev/null || return 1
+	[[ -n "$cached" && "$exp" =~ ^[0-9]+$ ]] || return 1
+	now=$(date +%s)
+	if [[ "$now" -ge "$exp" ]]; then
+		dlog "cached SID expired (now=$now exp=$exp)"
+		return 1
+	fi
+	resp=$(curl -s --connect-timeout "${API_CONNECT_TIMEOUT:-5}" --max-time 10 \
+		-X GET "$PI_URL/auth" -H "X-FTL-SID: $cached" 2>/dev/null) || return 1
+	valid=$(echo "$resp" | jq -r '.session.valid // false' 2>/dev/null || echo false)
+	if [[ "$valid" == "true" ]]; then
+		SID="$cached"
+		return 0
+	fi
+	dlog "cached SID rejected by FTL (restart/expiry); re-authenticating"
+	return 1
+}
+
+# WC7: Persist a freshly-obtained SID with an expiry derived from the auth
+# response's "validity" (minus a safety margin). Mode 600 — the SID is a bearer
+# credential. Atomic temp+rename so a torn write never yields a partial token.
+_save_cached_sid() {
+	local sid="$1" body="$2" validity now exp tmp
+	validity=$(echo "$body" | jq -r '.session.validity // 1800' 2>/dev/null || echo 1800)
+	[[ "$validity" =~ ^[0-9]+$ ]] || validity=1800
+	now=$(date +%s)
+	exp=$((now + validity - 60))
+	tmp="${SID_CACHE_FILE}.tmp.$$"
+	( umask 077; printf '%s\t%s\n' "$sid" "$exp" >"$tmp" ) 2>/dev/null \
+		&& mv -f "$tmp" "$SID_CACHE_FILE" 2>/dev/null \
+		|| { rm -f "$tmp" 2>/dev/null || true; return 0; }
+	chmod 600 "$SID_CACHE_FILE" 2>/dev/null || true
+}
+
 authenticate() {
 	dlog "authenticate entered"
 	if [[ -z "$PI_PASSWORD" ]]; then
@@ -379,27 +443,84 @@ authenticate() {
 		return 0
 	fi
 
+	# WC7: reuse a cached session to skip the expensive /auth hash entirely.
+	if [[ "${SID_CACHE:-true}" == "true" ]] && _load_cached_sid; then
+		dlog "auth: reused cached SID (skipped password hash)"
+		return 0
+	fi
+
+	# WC6: warn (don't mangle) if the password has trailing whitespace/newline —
+	# a stray char pasted into secrets.env is sent verbatim by jq --arg and FTL
+	# rejects it, which looks like a "wrong password" with no obvious cause.
+	if [[ "$PI_PASSWORD" != "${PI_PASSWORD%[[:space:]]}" ]]; then
+		log "WARN: PI_PASSWORD has trailing whitespace/newline — FTL will likely reject it. Check secrets.env."
+	fi
+
 	local AUTH_BODY=""
+	# jq --arg emits valid JSON for ANY password (quotes, backslashes, $, etc.),
+	# so a special character in the password is never a body/escaping problem —
+	# a failure here is the network/FTL, not the password content.
 	AUTH_BODY=$(jq -n --arg pw "$PI_PASSWORD" '{password: $pw}' 2>/dev/null) || {
 		log "WARN: jq failed to build auth body (rc=$?). Skipping auth."
 		return 0
 	}
 
-	local AUTH_RESPONSE="" auth_rc=0
-	AUTH_RESPONSE=$(curl -s --max-time 10 -X POST "$PI_URL/auth" \
-		-H "Content-Type: application/json" \
-		-d "$AUTH_BODY") || auth_rc=$?
-	dlog "curl auth rc=$auth_rc, response length=${#AUTH_RESPONSE}"
+	# Capture the HTTP status alongside the body (appended after a newline by
+	# curl's -w) so the log distinguishes a timeout (000) from rate-limiting
+	# (429) from a rejected password (401) — "rc=28" alone hid all of these.
+	# One retry on a pure timeout: a transient slow FTL (mid-refresh / rebuild)
+	# often answers on the second try; a genuinely-wrong password returns fast
+	# with a 401 and is NOT retried.
+	local AUTH_RESPONSE="" AUTH_RAW="" HTTP_CODE="" auth_rc=0 attempt=1
+	while :; do
+		auth_rc=0
+		AUTH_RAW=$(curl -s --connect-timeout "${API_CONNECT_TIMEOUT:-5}" --max-time "${API_AUTH_TIMEOUT:-45}" \
+			-w $'\n%{http_code}' -X POST "$PI_URL/auth" \
+			-H "Content-Type: application/json" \
+			-d "$AUTH_BODY") || auth_rc=$?
+		HTTP_CODE="${AUTH_RAW##*$'\n'}"          # last line = status code
+		AUTH_RESPONSE="${AUTH_RAW%$'\n'*}"        # everything before it = body
+		dlog "curl auth attempt=$attempt rc=$auth_rc http=$HTTP_CODE body_len=${#AUTH_RESPONSE}"
+		# rc=28 (timeout) with no usable status → retry once after a short pause.
+		if [[ $auth_rc -eq 28 && $attempt -eq 1 ]]; then
+			log "WARN: auth timed out after ${API_AUTH_TIMEOUT:-45}s (FTL busy or throttling); retrying once..."
+			attempt=2
+			sleep 2
+			continue
+		fi
+		break
+	done
 
 	if [[ $auth_rc -ne 0 || -z "$AUTH_RESPONSE" ]]; then
-		log "WARN: auth curl failed (rc=$auth_rc) or returned empty. Continuing without SID."
+		if [[ $auth_rc -eq 28 ]]; then
+			log "WARN: auth timed out (rc=28, http=${HTTP_CODE:-000}) talking to ${PI_URL}/auth."
+			log "      FTL accepted the connection but did not answer in time. Likely a busy box"
+			log "      (gravity rebuild?) or FTL throttling after earlier failed logins. Raise"
+			log "      API_AUTH_TIMEOUT in secrets.env, or check the password and wait out the throttle."
+		elif [[ "${HTTP_CODE:-000}" == "000" ]]; then
+			log "WARN: auth could not reach ${PI_URL}/auth (rc=$auth_rc). Verify PI_URL host/port/scheme."
+		else
+			log "WARN: auth curl failed (rc=$auth_rc, http=$HTTP_CODE) or returned empty. Continuing without SID."
+		fi
+		return 0
+	fi
+
+	# HTTP 429 = FTL rate-limited this client after too many failed logins. The
+	# body has no SID; surface it clearly rather than letting it fall through to
+	# the generic "password incorrect" branch.
+	if [[ "$HTTP_CODE" == "429" ]]; then
+		log "WARN: FTL rate-limited the auth (HTTP 429) — too many recent failed logins."
+		log "      Fix the password, then wait for FTL's lockout to clear before retrying."
+		[[ "$MODE" != "stats" ]] && { log "Auth Failed: rate-limited (HTTP 429)"; exit 1; }
 		return 0
 	fi
 
 	SID=$(echo "$AUTH_RESPONSE" | jq -r '.session.sid // empty' 2>/dev/null || echo "")
 
-	# Got a session token: authenticated.
+	# Got a session token: authenticated. Cache it (WC7) so the next run can
+	# reuse it instead of paying the multi-second hash again.
 	if [[ -n "$SID" ]]; then
+		[[ "${SID_CACHE:-true}" == "true" ]] && _save_cached_sid "$SID" "$AUTH_RESPONSE"
 		return 0
 	fi
 
@@ -421,11 +542,16 @@ authenticate() {
 	fi
 
 	# Genuine rejection: wrong password, 2FA/TOTP required, or an error body.
-	# Fatal for the mutating modes; the read-only dashboard tolerates it.
+	# Fatal for the mutating modes; the read-only dashboard tolerates it but no
+	# longer hides it — a silent --stats let a wrong password look like a healthy
+	# open API. (TOTP-enabled boxes need the 'totp' field, which warphole doesn't
+	# send; surface that as the cause when FTL reports it.)
+	local why="${MSG:-unknown (no message in auth response)}"
 	if [[ "$MODE" != "stats" ]]; then
-		log "Auth Failed: ${MSG:-unknown (no message in auth response)}"
+		log "Auth Failed (http=${HTTP_CODE:-?}): ${why}"
 		exit 1
 	fi
+	log "WARN: auth rejected (http=${HTTP_CODE:-?}): ${why}. Dashboard continues unauthenticated; /padd will likely show an auth error."
 	return 0
 }
 
