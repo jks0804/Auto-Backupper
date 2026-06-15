@@ -88,6 +88,16 @@ CONFIG = {
     "PI_URL": "http://127.0.0.1/api",
     "PI_PASSWORD": "",
     "REFRESH_RATE": 2,
+    # WC6: auth/API timeouts (seconds). FTL's /auth runs a deliberately-expensive
+    # balloon hash; on a Pi Zero it was measured ~22s (the response's "took"
+    # field), so a tight ceiling aborts a CORRECT password as a timeout. The
+    # connect timeout stays small so a wrong host/port fails fast instead.
+    "API_CONNECT_TIMEOUT": 5,
+    "API_AUTH_TIMEOUT": 45,
+    # WC7: cache + reuse the ~30min SID across runs so the expensive hash runs at
+    # most once per window (big win on weak hardware). False = auth fresh each run.
+    "SID_CACHE": True,
+    "SID_CACHE_FILE": "/tmp/warphole_sid",
     # --- Debug --- env override honored at startup
     "DEBUG_MODE": os.environ.get("WARPHOLE_DEBUG", "false").lower() == "true",
     # --- Internal Paths ---
@@ -368,6 +378,85 @@ def check_deps(need_rich):
             sys.exit(1)
 
 
+def _load_cached_sid():
+    # WC7: reuse a still-valid cached SID, confirmed with FTL via a cheap, no-hash
+    # GET /auth. Sets state['sid'] and returns True on a usable session.
+    import requests
+
+    try:
+        with open(CONFIG["SID_CACHE_FILE"]) as f:
+            cached, exp = f.read().split("\t", 1)
+        exp = int(exp.strip())
+    except (OSError, ValueError):
+        return False
+    if not cached or time.time() >= exp:
+        dlog("cached SID missing/expired")
+        return False
+    try:
+        r = requests.get(
+            f"{CONFIG['PI_URL']}/auth",
+            headers={"X-FTL-SID": cached},
+            timeout=(CONFIG["API_CONNECT_TIMEOUT"], 10),
+        )
+        valid = bool(((r.json() or {}).get("session") or {}).get("valid"))
+    except Exception:
+        return False
+    if valid:
+        state["sid"] = cached
+        return True
+    dlog("cached SID rejected by FTL (restart/expiry); re-authenticating")
+    return False
+
+
+def _save_cached_sid(sid, data):
+    # WC7: persist SID + expiry (validity minus a margin), mode 600 — the SID is a
+    # bearer credential. Atomic temp+rename so a torn write never yields a partial.
+    try:
+        validity = int(((data.get("session") or {}).get("validity")) or 1800)
+    except (TypeError, ValueError):
+        validity = 1800
+    exp = int(time.time()) + validity - 60
+    path = CONFIG["SID_CACHE_FILE"]
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            f.write(f"{sid}\t{exp}\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        _safe_remove(tmp)
+
+
+def resolve_docker_api_url():
+    # WC8: point PI_URL at the Docker container's IP when IS_DOCKER and PI_URL is
+    # still the localhost default. The FTL HTTP API lives inside the container;
+    # the host's 127.0.0.1 only reaches it if port 80 is published (often it
+    # isn't), so the default hangs/refuses even though `docker exec` works. An
+    # explicit PI_URL is respected; a host-network container (no bridge IP) keeps
+    # localhost; a missing docker binary is a no-op.
+    if not CONFIG["IS_DOCKER"] or CONFIG["PI_URL"] != "http://127.0.0.1/api":
+        return
+    if not shutil.which("docker"):
+        return
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "-f",
+             "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
+             CONFIG["DOCKER_CONTAINER_NAME"]],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        ip = line.strip()
+        parts = ip.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            CONFIG["PI_URL"] = f"http://{ip}/api"
+            dlog(f"resolved Docker API URL -> {CONFIG['PI_URL']} (container {CONFIG['DOCKER_CONTAINER_NAME']})")
+            return
+    dlog(f"Docker API: no bridge IP for {CONFIG['DOCKER_CONTAINER_NAME']} (host network?); keeping {CONFIG['PI_URL']}")
+
+
 def authenticate():
     # Set state['sid'] from the Pi-hole API. Tolerates network/API failures
     # (empty SID, continue) so stats/check degrade gracefully; fatal only in
@@ -379,24 +468,76 @@ def authenticate():
         dlog("PI_PASSWORD empty, skipping auth")
         return
 
-    try:
-        r = requests.post(
-            f"{CONFIG['PI_URL']}/auth",
-            json={"password": CONFIG["PI_PASSWORD"]},
-            timeout=10,
-        )
-        data = r.json()
-    except Exception as e:
-        log(f"WARN: auth request failed ({e}). Continuing without SID.")
+    # WC7: reuse a cached session to skip the expensive /auth hash entirely.
+    if CONFIG["SID_CACHE"] and _load_cached_sid():
+        dlog("auth: reused cached SID (skipped password hash)")
         return
 
-    state["sid"] = (data.get("session") or {}).get("sid") or ""
-    if not state["sid"]:
-        msg = (data.get("session") or {}).get("message", "") or ""
-        if "no password set" not in msg:
-            if state["mode"] != "stats":
-                log(f"Auth Failed: {msg}")
-                sys.exit(1)
+    # WC6: warn (don't mangle) on a trailing-whitespace password — sent verbatim
+    # by requests and rejected by FTL, which looks like a wrong password.
+    if CONFIG["PI_PASSWORD"] != CONFIG["PI_PASSWORD"].rstrip():
+        log("WARN: PI_PASSWORD has trailing whitespace/newline — FTL will likely reject it. Check secrets.env.")
+
+    # WC6: distinct connect/read timeouts; one retry on a pure read timeout (a
+    # transient slow FTL often answers on the second try; a wrong password
+    # returns fast with a 401 and is not retried).
+    timeout = (CONFIG["API_CONNECT_TIMEOUT"], CONFIG["API_AUTH_TIMEOUT"])
+    r = None
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                f"{CONFIG['PI_URL']}/auth",
+                json={"password": CONFIG["PI_PASSWORD"]},
+                timeout=timeout,
+            )
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 1:
+                log(f"WARN: auth timed out after {CONFIG['API_AUTH_TIMEOUT']}s (FTL busy or throttling); retrying once...")
+                time.sleep(2)
+                continue
+            log(f"WARN: auth timed out talking to {CONFIG['PI_URL']}/auth. FTL accepted the connection but")
+            log("      did not answer in time — a busy box (gravity rebuild?) or FTL throttling after earlier")
+            log("      failed logins. Raise API_AUTH_TIMEOUT in secrets.env, or check the password/throttle.")
+            return
+        except Exception as e:
+            log(f"WARN: auth request failed ({e}). Verify PI_URL host/port/scheme. Continuing without SID.")
+            return
+
+    try:
+        data = r.json()
+    except Exception:
+        log(f"WARN: auth returned non-JSON (http={r.status_code}). Continuing without SID.")
+        return
+
+    # WC6: 429 = FTL rate-limited this client after too many failed logins.
+    if r.status_code == 429:
+        log("WARN: FTL rate-limited the auth (HTTP 429) — too many recent failed logins.")
+        log("      Fix the password, then wait for FTL's lockout to clear before retrying.")
+        if state["mode"] != "stats":
+            log("Auth Failed: rate-limited (HTTP 429)")
+            sys.exit(1)
+        return
+
+    session = data.get("session") or {}
+    state["sid"] = session.get("sid") or ""
+    if state["sid"]:
+        if CONFIG["SID_CACHE"]:
+            _save_cached_sid(state["sid"], data)
+        return
+
+    # No SID: distinguish an OPEN API (valid=true / "no password set" → proceed
+    # unauthenticated) from a genuine rejection. Decide on session.valid, not the
+    # message text (a cleared-password box can report valid=true + a stale msg).
+    valid = session.get("valid")
+    msg = session.get("message") or (data.get("error") or {}).get("message") or ""
+    if valid is True or "no password set" in msg:
+        dlog(f"auth: no session required (valid={valid} msg='{msg}') — continuing unauthenticated")
+        return
+    if state["mode"] != "stats":
+        log(f"Auth Failed (http={r.status_code}): {msg or 'unknown'}")
+        sys.exit(1)
+    log(f"WARN: auth rejected (http={r.status_code}): {msg or 'unknown'}. Dashboard continues unauthenticated; /padd will likely show an auth error.")
 
 
 def api_get_padd(timeout=10):
@@ -1240,7 +1381,10 @@ def cleanup():
                                stderr=subprocess.DEVNULL)
 
     # Best-effort logout with a short timeout; swallow errors.
-    if state["sid"]:
+    # WC7: when SID caching is on, do NOT log out — the point is to keep the
+    # session alive for the next run to reuse (only one SID is ever cached, and
+    # it expires on its own). Only fresh-auth-every-run mode logs out here.
+    if state["sid"] and not CONFIG["SID_CACHE"]:
         try:
             import requests
 
@@ -1334,6 +1478,10 @@ def main():
                 print()
                 print_usage()
                 sys.exit(1)
+
+    # WC8: when running against a Docker Pi-hole, point PI_URL at the container's
+    # IP (no-op if overridden, host-network, or docker absent) so API calls land.
+    resolve_docker_api_url()
 
     # Route execution: lock for mutating modes; stats runs read-only.
     if state["mode"] == "backup":
