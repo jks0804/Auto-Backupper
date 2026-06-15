@@ -12,9 +12,10 @@ leaner, dependency-light codebase that is easier to read, extend, and run anywhe
 is available.
 
 > **Looking for the full suite?** The Bash branch (`main`) is the reference implementation and
-> ships extra tooling — `auto-restorer.sh`, the `legacy-checksum-generatator.sh`, and the
-> Houston-style Watchtower dashboards (`--status`, `--ab-graph`, `--hub`) — that this port does
-> not (yet) replicate. See [Differences from the Bash suite](#differences-from-the-bash-suite).
+> ships the Houston-style Watchtower dashboards (`--status`, `--ab-graph`, `--hub`) that this
+> port does not (yet) replicate. Conversely, this branch ships **one tool the Bash suite has
+> no equivalent for**: `auto-backupper-client.py`, the cross-platform desktop backup client.
+> See [Differences from the Bash suite](#differences-from-the-bash-suite).
 
 * * * * *
 
@@ -51,7 +52,9 @@ is available.
 | `warphole.py`       | Pi-hole sidecar: Teleporter backup, gravity health-check, live stats |
 | `auto-restorer.py`  | Disaster recovery: list/inspect/verify/restore, corruption report    |
 | `legacy-checksum-generatator.py` | Back-fill dated checksums for existing archives         |
-| `auto_backupper.cfg`| Shared configuration (Bash-syntax `KEY=val` / `KEY=(arrays)`)        |
+| `auto-backupper-client.py` | **Cross-platform desktop client** (Windows/macOS/Linux): produces FamilyBackups user + system archives, delivers them to the server, restores locally |
+| `auto_backupper.cfg`| Shared server configuration (Bash-syntax `KEY=val` / `KEY=(arrays)`) |
+| `auto_backupper_client.cfg` | Desktop-client configuration (same Bash-syntax parser)       |
 
 * * * * *
 
@@ -59,11 +62,17 @@ is available.
 ---------------
 
 - **Python 3.7+**
-- **Run as root** (all three scripts hard-require `uid 0`).
+- **Run as root** for the server-side tools (`auto-backupper.py`, `watchtower.py`,
+  `auto-restorer.py`, `warphole.py`, `legacy-checksum-generatator.py` hard-require `uid 0`).
+  The desktop client (`auto-backupper-client.py`) does **not** require admin/root — it degrades
+  to the current user's data with warnings when unprivileged.
 - **System binaries:**
   - `auto-backupper.py` / `watchtower.py`: `rsync`, `tar`, `sha256sum` (pre-flight enforced);
     `pigz` (optional, for multi-threaded compression), `docker` (optional).
   - `warphole.py`: `curl`, `jq`, `awk`, `uptime`, and `docker` (when `IS_DOCKER` is true).
+  - `auto-backupper-client.py`: stdlib only for core work; `ssh`/`scp` or `rsync` only for the
+    `rsync_ssh` destination; on Windows, `diskshadow`/`vssadmin` + `reg`/`winget`/`powershell`
+    are used opportunistically for VSS and system inventory.
 - **Python packages (warphole only):** `requests` and `rich`. `warphole.py` checks for these on
   startup and offers to `pip install` them interactively.
 
@@ -156,6 +165,41 @@ repairs it (`pihole -g`), with a low-RAM reboot-recovery path guarded by a repai
 `PI_PASSWORD` in `CONFIG` for authenticated API access; leaving it empty skips auth (stats/check
 degrade gracefully).
 
+### auto-backupper-client.py — cross-platform desktop client
+
+Runs on family/client **Windows, macOS, and Linux** PCs to replace the legacy Windows 7 backup
+feature. It produces two archives per machine — a **USER-data** archive and a **SYSTEM-state**
+archive — in the suite's exact `FamilyBackups/<member>/{users,systems}/` layout (`./`-rooted
+`tar.gz` + dated `.checksums/`), then delivers them to one or more destinations. The output drops
+straight into the server's `BACKUP_BASE`, where `watchtower`/`auto-restorer` treat it as a
+first-class backup. It uses stdlib `tarfile` + `hashlib` (no `tar`/`sha256sum`/`rsync` needed for
+the core work) and **does not require admin/root** — it degrades to the current user's profile
+with warnings when unprivileged.
+
+```bash
+python3 auto-backupper-client.py --backup both          # users + system, deliver to all dests
+python3 auto-backupper-client.py --backup users --dry-run
+python3 auto-backupper-client.py --list                 # list reachable archives
+python3 auto-backupper-client.py --verify ARCHIVE | --verify-all
+python3 auto-backupper-client.py --restore ARCHIVE --target PATH [--only ./users/docs]
+python3 auto-backupper-client.py --install-schedule     # Task Scheduler / launchd / systemd-timer
+```
+
+| Capability | Behavior |
+|------------|----------|
+| Destinations | `local` (external drive), `share` (SMB/NFS mount), `rsync_ssh` (push over Tailscale/VPN). Configure 1+ in `auto_backupper_client.cfg`; delivery is atomic (data → rename → checksum). |
+| Windows locked files | VSS shadow copy when elevated (captures `NTUSER.DAT`, browser/Outlook); otherwise skip-and-warn. |
+| System scope | Config/state to rebuild onto a fresh OS (registry export + program inventory on Windows; app/Homebrew/`defaults` + `/etc` on macOS/Linux) — **not** a bootable image. Marked `SYSTEM_INCOMPLETE` in the manifest when captured unprivileged. |
+| Scheduling | Native OS scheduler (`--install-schedule`); not a daemon. |
+| Retention | The **server** owns retention; the client keeps only `LOCAL_KEEP` local copies. |
+
+> **Deployment prerequisite (server side):** the client pushes *finished* archives into
+> `BACKUP_BASE/shares/FamilyBackups/<member>/…`, the same path the server's own FamilyBackups
+> producer writes. For each client-managed member, ensure no raw
+> `SHARES_BASE_FOLDER/FamilyBackups/<member>/` tree exists (the server loop skips absent dirs),
+> **or** remove `"FamilyBackups"` from the server's `SHARES_TO_BACKUP`, so the server never
+> re-tars/overwrites a client-pushed archive.
+
 * * * * *
 
 🗂️ Paths & Artifacts
@@ -174,19 +218,25 @@ degrade gracefully).
 🔀 Differences from the Bash suite
 ----------------------------------
 
-The Python edition is a faithful *functional* port, not a 1:1 feature clone. Known gaps vs. the
-`main` (Bash) branch:
+The Python edition is a faithful *functional* port, not a 1:1 feature clone. Remaining gaps vs.
+the `main` (Bash) branch:
 
-- **No `auto-restorer`** — disaster-recovery / restore tooling is Bash-only for now.
-- **No `legacy-checksum-generatator`** equivalent.
 - **No Watchtower dashboards** — the Bash `--status`, `--ab-graph`, and `--hub` command centers
   are not ported.
-- **No embedded `MANIFEST.txt`** inside archives.
-- **No discovery-date checksum suffix** — checksums are plain SHA256 files without the Bash
-  suite's portable `_<YYYYMMDD>` age suffix, so pull-side retention relies on local mtime.
 - **No sparse-aware `tar -S`** flag in the archive command.
 
-When in doubt, the Bash branch (`main`) is authoritative.
+(`auto-restorer.py`, `legacy-checksum-generatator.py`, embedded `MANIFEST.txt`, and the portable
+`_<YYYYMMDD>` discovery-date checksum suffix — once listed here as gaps — are now implemented on
+this branch.)
+
+**Parity inversion (Python-only):** `auto-backupper-client.py` is the one component that exists
+**only on this branch** — the Bash suite has no `auto-backupper-client.sh`. It is the
+cross-platform desktop client; its on-disk output format is pinned by the same FamilyBackups
+contract `auto-backupper.py`'s `create_archive(dest, sub_full, ["."])` produces, so any future
+Bash equivalent must match it. (When updating the Bash branch's `PARITY-GAPS.md`, record this
+reversed gap there too.)
+
+When in doubt, the Bash branch (`main`) is authoritative for the *shared* tooling.
 
 * * * * *
 
