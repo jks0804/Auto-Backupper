@@ -396,6 +396,28 @@ check_deps() {
 # error logged. Splitting the pipeline lets us capture curl's rc with
 # `|| auth_rc=$?` and treat network failures as "no SID, continue" so
 # the downstream /padd check (and its -2 [null] detection) still runs.
+# WC8: Resolve the Docker Pi-hole's API URL. The FTL HTTP API lives INSIDE the
+# container; on the host, 127.0.0.1 only reaches it if the container publishes
+# port 80 (frequently it doesn't), so the default localhost PI_URL hangs/refuses
+# even though `docker exec` works fine. When IS_DOCKER is set and PI_URL is still
+# the localhost default, derive the container's bridge IP so the API calls land.
+# An explicit PI_URL (any non-default value, e.g. set in secrets.env) is
+# respected, and a host-network container (no bridge IP) keeps localhost.
+resolve_docker_api_url() {
+	[[ "$IS_DOCKER" == "true" ]] || return 0
+	[[ "$PI_URL" == "http://127.0.0.1/api" ]] || return 0
+	command -v docker >/dev/null 2>&1 || return 0
+	local ip
+	ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+		"$DOCKER_CONTAINER_NAME" 2>/dev/null | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+	if [[ -n "$ip" ]]; then
+		PI_URL="http://${ip}/api"
+		dlog "resolved Docker API URL -> $PI_URL (container $DOCKER_CONTAINER_NAME)"
+	else
+		dlog "Docker API: no bridge IP for $DOCKER_CONTAINER_NAME (host network?); keeping $PI_URL"
+	fi
+}
+
 # WC7: Load a still-valid cached SID and confirm it with FTL via a cheap,
 # no-hash GET /auth. Sets SID and returns 0 on a usable session; 1 otherwise
 # (missing/expired/rejected — caller then authenticates fresh).
@@ -1562,6 +1584,11 @@ else
 		shift
 	done
 fi
+
+# WC8: when running against a Docker Pi-hole, point PI_URL at the container's IP
+# (no-op if PI_URL was overridden, the container uses host networking, or docker
+# isn't available) so the HTTP API calls reach FTL instead of the host.
+resolve_docker_api_url
 
 # Route Execution
 # WC1: Acquire exclusive lock for mutating modes. Stats is read-only so
