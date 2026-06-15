@@ -34,7 +34,12 @@ LOCKFILE="/var/lock/auto_backupper.lock"
 BACKUP_PIDFILE="/var/run/auto_backupper.pid"
 
 # --- Enclave & State Paths ---
-ENCLAVE_DIR="/tmp/enclave"
+# The enclave is the suite's working-files directory (a small filesystem-as-DB
+# of run state, IPC queue, and session manifest). Kept under /var/opt for a
+# consistent, suite-wide home (watchtower's triggers/status and the restorer's
+# container list live here too). Note: large archive-creation scratch stays in
+# /tmp on purpose (see create_archive) to keep big writes off persistent disk.
+ENCLAVE_DIR="/var/opt/enclave"
 STATE_FILE="${ENCLAVE_DIR}/ab_state"
 RUNNING_CONTAINERS_LIST="${ENCLAVE_DIR}/containers.list"
 
@@ -207,14 +212,14 @@ log() {
 
 # State & IPC Management
 init_state() {
-	# State/IPC bookkeeping lives under /tmp and is required for the run's
-	# own plumbing, so it is created for real even in dry-run mode (where
-	# the mkdir/rm names are shadowed by the [DRY] logging overrides).
+	# State/IPC bookkeeping lives under the enclave (/var/opt/enclave) and is
+	# required for the run's own plumbing, so it is created for real even in
+	# dry-run mode (where the mkdir/rm names are shadowed by the [DRY] overrides).
 	/bin/mkdir -p "$ENCLAVE_DIR"
 
 	# Crash recovery: if a previous run was SIGKILLed while Docker was stopped,
-	# the state file survives in /tmp and the running_containers list survives
-	# too. Restart Docker BEFORE truncating the state file.
+	# the state file survives in the enclave and the running_containers list
+	# survives too. Restart Docker BEFORE truncating the state file.
 	if [[ -f "$STATE_FILE" ]] && grep -q '^DOCKER_STOPPED=true$' "$STATE_FILE" 2>/dev/null; then
 		log "RECOVERY: Previous run left Docker stopped. Attempting restart before proceeding..."
 		# sys_docker_start is defined later in the file via OS detection, so this
@@ -2232,7 +2237,7 @@ pull_flow() {
 				#   1. Gives us an accurate count up front so the user knows
 				#      the scope of work (a 10-file session vs a 10000-file
 				#      backlog look identical in logs otherwise).
-				#   2. The user can inspect /tmp/enclave/queue/pull_verify_list
+				#   2. The user can inspect /var/opt/enclave/queue/pull_verify_list
 				#      from another shell to see what's queued.
 				#   3. Separates find-tree-walk time from hash time in the log,
 				#      making it clearer where any slowness is coming from.

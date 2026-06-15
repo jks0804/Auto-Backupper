@@ -62,15 +62,21 @@ BACKUP_LOCKFILE="/var/lock/auto_backupper.lock"
 WATCHTOWER_LOCK="/var/lock/ab_watchtower.lock"
 PID_FILE="/var/run/ab_watchtower.pid"
 
-# IPC Trigger Files
-TRIGGER_UPDATE="/tmp/ab_watchtower_trigger_update"
-TRIGGER_SCAN="/tmp/ab_watchtower_trigger_scan"
-TRIGGER_VERIFY="/tmp/ab_watchtower_trigger_verify"
-TRIGGER_CONFIG="/tmp/ab_watchtower_trigger_config"
-TRIGGER_CLEANUP="/tmp/ab_watchtower_trigger_cleanup"
-TRIGGER_FORCE="/tmp/ab_watchtower_trigger_force"
-TRIGGER_RECOVERY="/tmp/ab_watchtower_trigger_recovery"
-STATUS_FILE="/tmp/ab_watchtower.status"
+# IPC Trigger + status files. These live in the shared enclave (the suite's
+# working-files dir); auto-backupper.sh uses the SAME /var/opt/enclave path.
+# They are ephemeral IPC: a CLI invocation drops a trigger file, the running
+# daemon consumes it. (The reboot-must-survive scheduler markers are the
+# separate AB_STATE_DIR under .checksums/ below — do NOT move those here.)
+ENCLAVE_DIR="/var/opt/enclave"
+mkdir -p "$ENCLAVE_DIR" 2>/dev/null || true
+TRIGGER_UPDATE="${ENCLAVE_DIR}/ab_watchtower_trigger_update"
+TRIGGER_SCAN="${ENCLAVE_DIR}/ab_watchtower_trigger_scan"
+TRIGGER_VERIFY="${ENCLAVE_DIR}/ab_watchtower_trigger_verify"
+TRIGGER_CONFIG="${ENCLAVE_DIR}/ab_watchtower_trigger_config"
+TRIGGER_CLEANUP="${ENCLAVE_DIR}/ab_watchtower_trigger_cleanup"
+TRIGGER_FORCE="${ENCLAVE_DIR}/ab_watchtower_trigger_force"
+TRIGGER_RECOVERY="${ENCLAVE_DIR}/ab_watchtower_trigger_recovery"
+STATUS_FILE="${ENCLAVE_DIR}/ab_watchtower.status"
 
 # State Tracking (Prevents Log Flooding)
 LAST_LOGGED_THREADS="-1"
@@ -336,6 +342,19 @@ log() {
 
 set_status() {
 	echo "$1" >"$STATUS_FILE"
+}
+
+# Drop an IPC trigger file for the daemon, verifying the write succeeded. The
+# enclave is now root-owned (no longer the world-writable /tmp), so a failed
+# touch means the caller can't write it (e.g. invoked unprivileged) — report it
+# and abort instead of the misleading "Signal sent" a swallowed failure prints
+# (the daemon also picks triggers up by polling, so a silently-missing file
+# would otherwise just never fire). Run watchtower's trigger commands as root.
+drop_trigger() {
+	if ! touch "$1" 2>/dev/null; then
+		echo "Error: cannot write trigger file '$1' (enclave not writable — run as root)." >&2
+		exit 1
+	fi
 }
 
 # Atomic write of a single short value to a file. Used for LAST_RUN_*
@@ -3364,7 +3383,7 @@ _hub_signal_action() {
 	if [[ "$action" == "reload" ]]; then
 		echo "$CFG_TO_LOAD" >"$trigger_file"
 	else
-		touch "$trigger_file"
+		drop_trigger "$trigger_file"
 	fi
 	[[ -n "$DAEMON_PID" ]] && kill -SIGUSR1 "$DAEMON_PID" 2>/dev/null || true
 	_hub_notice "Signal sent — $label queued."
@@ -3780,7 +3799,10 @@ case "$MODE" in
 		# process triggers) and the file-gated re-source block never ran, so bare
 		# --reload stayed a no-op. Default to the daemon's own active config path
 		# (mirrors the hub's reload). The daemon re-reads the LIVE file contents.
-		echo "${CLI_CONFIG:-$CFG_TO_LOAD}" >"$TRIGGER_CONFIG"
+		if ! echo "${CLI_CONFIG:-$CFG_TO_LOAD}" >"$TRIGGER_CONFIG" 2>/dev/null; then
+			echo "Error: cannot write trigger file '$TRIGGER_CONFIG' (enclave not writable — run as root)." >&2
+			exit 1
+		fi
 		echo "Queued config reload: ${CLI_CONFIG:-$CFG_TO_LOAD}"
 		notify_daemon "RELOAD"
 		exit 0
@@ -3791,28 +3813,28 @@ case "$MODE" in
 	;;
 "--update")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_UPDATE"
+		drop_trigger "$TRIGGER_UPDATE"
 		notify_daemon "perform UPDATE"
 		exit 0
 	fi
 	;;
 "--recover")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_RECOVERY"
+		drop_trigger "$TRIGGER_RECOVERY"
 		notify_daemon "perform RECOVERY"
 		exit 0
 	fi
 	;;
 "--scan")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_SCAN"
+		drop_trigger "$TRIGGER_SCAN"
 		notify_daemon "perform SCAN"
 		exit 0
 	fi
 	;;
 "--verify")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_VERIFY"
+		drop_trigger "$TRIGGER_VERIFY"
 		notify_daemon "perform VERIFY"
 		exit 0
 	fi
@@ -3820,14 +3842,14 @@ case "$MODE" in
 	;;
 "--cleanup")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_CLEANUP"
+		drop_trigger "$TRIGGER_CLEANUP"
 		notify_daemon "perform CLEANUP"
 		exit 0
 	fi
 	;;
 "--force")
 	if [[ "$DAEMON_RUNNING" == "true" ]]; then
-		touch "$TRIGGER_FORCE"
+		drop_trigger "$TRIGGER_FORCE"
 		notify_daemon "FORCE cycle"
 		exit 0
 	else
@@ -3901,6 +3923,25 @@ case "$MODE" in
 	;;
 "--monitor")
 	log "STARTUP: Monitor Mode Active. Interval: ${MONITOR_INTERVAL:-300}s"
+
+	# The daemon is the one process that genuinely needs the enclave (it writes
+	# the status file and reads triggers there). Fail loudly if it can't be
+	# created/written rather than silently degrading — the top-level mkdir is
+	# best-effort so read-only modes (--status/--help) stay non-fatal, but the
+	# daemon must have a writable enclave.
+	if ! mkdir -p "$ENCLAVE_DIR" 2>/dev/null || [[ ! -w "$ENCLAVE_DIR" ]]; then
+		log "FATAL: enclave directory '$ENCLAVE_DIR' is not writable. Run the daemon as root or fix its permissions."
+		exit 1
+	fi
+
+	# Clear any stale trigger files (and the status file) left by a prior daemon
+	# instance — or, now that the enclave is on persistent /var/opt (vs the old
+	# tmpfs /tmp), ones that survived a reboot — so a long-stale CLI trigger
+	# doesn't auto-fire on startup and a dead daemon's status isn't mistaken for
+	# live. A fresh trigger from a running CLI is still caught at the top of the
+	# loop below. (Matches the old behaviour where /tmp wiped these on boot.)
+	rm -f "$TRIGGER_UPDATE" "$TRIGGER_SCAN" "$TRIGGER_VERIFY" "$TRIGGER_CONFIG" \
+		"$TRIGGER_CLEANUP" "$TRIGGER_FORCE" "$TRIGGER_RECOVERY" "$STATUS_FILE" 2>/dev/null || true
 
 	# Post-(re)boot ghost-container catch. The daemon normally starts at boot
 	# (or Unraid array start), so this plays the role the standalone recovery

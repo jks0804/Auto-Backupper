@@ -620,8 +620,8 @@ GAPS:
       bash: pull_flow lines 1988-2006: uses find to enumerate top-level non-hidden dirs
       py:   pull_flow (line 582) uses os.listdir and filters startswith('.'), which is equivalent but less robust (doesn't error on permission issues)
       loc:  lines 1988-2006
-  [LOW] Enclave IPC queue directory (/tmp/enclave/queue) for error files (status=missing, effort=small) [analysis]
-      bash: Lines 37-48: ENCLAVE_DIR, IPC_BASE, IPC_ERRORS, SESSION_MANIFEST all under /tmp/enclave/queue for atomic cleanup on exit
+  [LOW] Enclave IPC queue directory (/var/opt/enclave/queue) for error files (status=missing, effort=small) [analysis]
+      bash: Lines 37-48: ENCLAVE_DIR, IPC_BASE, IPC_ERRORS, SESSION_MANIFEST all under /var/opt/enclave/queue for atomic cleanup on exit
       py:   No IPC queue; errors tracked in memory only
       loc:  lines 37-48
   [LOW] Hostname case-drift detection and migration warnings (status=missing, effort=small) [analysis]

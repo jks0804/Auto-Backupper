@@ -18,7 +18,7 @@ Auto-Backupper is a production-grade bash suite designed to automate backups, sy
 
 -   **Atomic Verification:** Generates SHA256 checksums for every backup artifact and verifies them during creation *and* after remote pulls. Each checksum carries a `_<YYYYMMDD>` discovery-date suffix so file age is portable across hosts and immune to rsync's mtime preservation — pull-side retention can correctly skip stale files regardless of when each remote rotates.
 
--   **Self-Healing:** State-based recovery (`/tmp/ab_state`) ensures system stability if a script is interrupted or crashes.
+-   **Self-Healing:** State-based recovery (`/var/opt/enclave/ab_state`) ensures system stability if a script is interrupted or crashes.
 
 -   **Watchtower Daemon:** A companion daemon that handles scheduling, cache monitoring (invoking "Mover" when full), auto-updates for Docker containers, and silent corruption detection. Ships with `--status` for a one-shot scheduler snapshot, `--ab-graph` for a live full-terminal dashboard during in-progress backups or restores (phase timeline, CPU/MEM/disk/network sparklines, optional TSO offload %), and `--hub` — a Houston-style command center with single-key shortcuts to every entry point across the suite.
 
@@ -469,7 +469,7 @@ RECENT LOG:
 
 **Action behaviour:**
 
--   **Watchtower triggers (`c`, `u`, `k`, `v`, `R`)** drop the matching `/tmp/ab_watchtower_trigger_*` file and send `SIGUSR1` to the daemon. Identical IPC the existing standalone subcommands use — the daemon polls these files every 3 seconds. Triggers when the daemon isn't running produce a friendly "daemon not running" notice; no errors.
+-   **Watchtower triggers (`c`, `u`, `k`, `v`, `R`)** drop the matching `/var/opt/enclave/ab_watchtower_trigger_*` file and send `SIGUSR1` to the daemon. Identical IPC the existing standalone subcommands use — the daemon polls these files every 3 seconds. Triggers when the daemon isn't running produce a friendly "daemon not running" notice; no errors.
 -   **Daemon lifecycle (`d`, `D`).** `d` is a context-aware toggle: starts the daemon when stopped, stops it when running. The label on the menu updates to show which action `d` will take ("Daemon: START (stopped)" vs "Daemon: STOP (running)"). `D` always restarts (stops if running, sleeps 1 s for the kernel to release the flock, then starts). Both prompt for confirmation once. Start re-execs `watchtower.sh --monitor` via `nohup` + `disown` so the daemon survives the hub session. Stop SIGTERMs the daemon and escalates to SIGKILL only if it doesn't exit cleanly within `DAEMON_SHUTDOWN_GRACE` + 5 seconds (default 35) — long enough for the daemon's own graceful shutdown to finish an in-flight Docker update/recovery rather than orphaning a container (the daemon's EXIT trap removes the PID/STATUS files first).
 -   **Backup mode keys (`s`, `p`, `P`, `B`)** invoke `MAIN_BACKUP_SCRIPT` via `nohup … &` with the chosen `--mode`, so the worker runs detached and the hub keeps rendering. `s` uses the cfg-default `MODE`.
 -   **`x` Stop backup** re-execs `watchtower.sh --stop-backup` as a child, inheriting that mode's escalating-signals logic without duplicating it.
@@ -740,7 +740,7 @@ The script's date-source label (`embedded` from the filename's `_<YYYYMMDD>` suf
 
 -   **Idempotency:** The scripts use lockfiles (`/var/lock/`) to prevent overlapping runs. The worker, daemon, and restorer all take separate locks so read-only restorer commands can run during a scheduled backup.
 
--   **State Recovery:** If the worker crashes while Docker is stopped, the next run (or trap handler) detects the `DOCKER_STOPPED=true` state in `/tmp/enclave/ab_state` and forces a restart. The restorer carries its own Docker trap for the same reason.
+-   **State Recovery:** If the worker crashes while Docker is stopped, the next run (or trap handler) detects the `DOCKER_STOPPED=true` state in `/var/opt/enclave/ab_state` and forces a restart. The restorer carries its own Docker trap for the same reason.
 
 -   **Pre-flight abort:** Space, writability, binary availability, and remote-mount checks all run before a single byte is written. An abort here leaves the system untouched.
 

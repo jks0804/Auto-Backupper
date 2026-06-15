@@ -622,7 +622,9 @@ tar_decompress_flag() {
 # --stop-docker; on Unraid the service stop takes care of the mount, on
 # other Linuxes the daemon will re-open the fresh file on restart.
 
-UNRAID_CONTAINERS_LIST="/tmp/auto_restorer_containers.list"
+# Restore-time record of which containers we stopped (to restart them after).
+# Lives in the shared enclave with the rest of the suite's IPC/working state.
+UNRAID_CONTAINERS_LIST="/var/opt/enclave/auto_restorer_containers.list"
 
 docker_stop_for_restore() {
 	if [[ "$DRY_RUN" == "true" ]]; then
@@ -659,6 +661,7 @@ docker_stop_for_restore() {
 			# Record so we can restart the same set afterward. If the list
 			# file already exists from a crashed previous run, overwrite it
 			# — stale state is worse than a partial list.
+			mkdir -p "$(dirname "$UNRAID_CONTAINERS_LIST")" 2>/dev/null || true
 			docker ps --format '{{.Names}}' >"$UNRAID_CONTAINERS_LIST" 2>/dev/null || true
 			# `xargs -r` avoids invoking docker with no args when there are
 			# no containers to stop. --time flag matches auto-backupper's
