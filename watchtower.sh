@@ -701,7 +701,11 @@ file_is_stable() {
 
 is_backup_running() {
 	if [[ -f "$BACKUP_LOCKFILE" ]]; then
-		exec 9<"$BACKUP_LOCKFILE"
+		# If the lockfile can't be opened (unreadable, or it vanished between the
+		# -f test and here), treat it as "not running" rather than failing the
+		# flock probe and falsely reporting a backup -- which would pause the
+		# whole monitor loop. auto-backupper's own flock still serializes real runs.
+		exec 9<"$BACKUP_LOCKFILE" 2>/dev/null || return 1
 		if ! flock -n -s 9; then
 			exec 9<&-
 			return 0
@@ -3398,8 +3402,13 @@ _hub_signal_action() {
 		return
 	fi
 	# For --reload, write the active config so the daemon knows what to load.
+	# Verify the write (the enclave is root-owned, not the old world-writable
+	# /tmp) instead of printing "Signal sent" on a silently-failed write.
 	if [[ "$action" == "reload" ]]; then
-		echo "$CFG_TO_LOAD" >"$trigger_file"
+		if ! echo "$CFG_TO_LOAD" >"$trigger_file" 2>/dev/null; then
+			_hub_notice "ERROR: cannot write trigger '$trigger_file' (enclave not writable — run as root)."
+			return
+		fi
 	else
 		drop_trigger "$trigger_file"
 	fi
@@ -3966,8 +3975,11 @@ case "$MODE" in
 	# tool's "At Startup of Array" hook used to: repair containers whose
 	# writable layer vanished across the reboot, before normal monitoring.
 	if [[ "${DOCKER_RECOVERY_ENABLE:-false}" == "true" && "${DOCKER_RECOVERY_RUN_ON_STARTUP:-true}" == "true" ]]; then
-		run_docker_recovery_task
-		atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$(date +%s)"
+		# Background it so a wedged dockerd at boot (exactly the post-reboot state
+		# this pass targets) can't stall the daemon's own startup -- monitoring and
+		# trigger handling must come up regardless. Mirrors the periodic recovery
+		# pass, which is also backgrounded; globals are reset at the task's top.
+		{ run_docker_recovery_task; atomic_write "$RECOVERY_LAST_PASS_EPOCH" "$(date +%s)"; } &
 	fi
 
 	# State tracking to prevent log flooding
