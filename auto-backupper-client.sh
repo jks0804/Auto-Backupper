@@ -75,17 +75,28 @@ _DEFAULT_MEMBER="$(hostname 2>/dev/null | cut -d. -f1 | tr '[:lower:]' '[:upper:
 LOG_MAX_SIZE="$((10 * 1024 * 1024))"
 LOG_BACKUPS=5
 
-# Per-OS default log/lock/state/config locations, with a writable fallback.
+# Per-OS default config location (read-only access is fine for non-root).
 if [[ "$OS_TYPE" == "macos" ]]; then
-	_BASE_DIR="/Library/Application Support/auto-backupper"
+	_SYS_BASE_DIR="/Library/Application Support/auto-backupper"
+else
+	_SYS_BASE_DIR="/etc/auto-backupper"
+fi
+DEFAULT_CONFIG_FILE="${_SYS_BASE_DIR}/auto_backupper_client.cfg"
+
+# This client is designed to run UNPRIVILEGED (it degrades to the current user's
+# data). When not root, the system base dirs (/etc, /Library) aren't writable,
+# so the lock/state/log there would silently fail and the backup would no-op.
+# Pick a user-writable base when non-root; root keeps the system locations.
+# (Use `id -u` directly — is_privileged() is defined later in the file.)
+if [[ "$(id -u 2>/dev/null || echo 0)" -eq 0 ]]; then
+	_BASE_DIR="$_SYS_BASE_DIR"
 	LOGFILE="/var/log/auto-backupper-client.log"
 else
-	_BASE_DIR="/etc/auto-backupper"
-	LOGFILE="/var/log/auto-backupper-client.log"
+	_BASE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/auto-backupper"
+	LOGFILE="${_BASE_DIR}/auto-backupper-client.log"
 fi
 LOCKDIR="${_BASE_DIR}/auto-backupper-client.lock.d"
 STATE_DIR="${_BASE_DIR}/state"
-DEFAULT_CONFIG_FILE="${_BASE_DIR}/auto_backupper_client.cfg"
 
 # Runtime globals.
 CURRENT_ARCHIVE_FILE=""
@@ -640,7 +651,7 @@ produce_backup() {
 	: >"$SESSION_MANIFEST" 2>/dev/null || true
 	log "=== Backup: member=${MEMBER} scope=${BACKUP_SCOPE} os=${OS_TYPE} staging=${STAGING_BASE} ==="
 
-	local do_users=0 do_system=0
+	local do_users=0 do_system=0 produce_fail=0
 	[[ ( "$BACKUP_SCOPE" == "users" || "$BACKUP_SCOPE" == "both" ) && "$BACKUP_USERS" == "true" ]] && do_users=1
 	[[ ( "$BACKUP_SCOPE" == "system" || "$BACKUP_SCOPE" == "both" ) && "$BACKUP_SYSTEM" == "true" ]] && do_system=1
 
@@ -657,7 +668,7 @@ produce_backup() {
 			if [[ $has_member -eq 0 ]]; then
 				log "  WARN: no user data found in configured folders; skipping users archive."
 			else
-				client_create_archive "$(_member_archive_path users)" "FamilyBackups/${MEMBER}/users" "${USER_TARGS[@]}"
+				client_create_archive "$(_member_archive_path users)" "FamilyBackups/${MEMBER}/users" "${USER_TARGS[@]}" || produce_fail=1
 			fi
 		fi
 	fi
@@ -673,7 +684,7 @@ produce_backup() {
 			client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "${stage:-/nonexistent}" .
 		else
 			collect_system_stage "$stage"
-			client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "$stage" .
+			client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "$stage" . || produce_fail=1
 			if [[ "$MANIFEST_STATUS" == "SYSTEM_INCOMPLETE" ]]; then
 				send_notify "warning" "System backup incomplete" "${MEMBER}: system archive degraded. Run elevated for a complete capture."
 			fi
@@ -681,7 +692,12 @@ produce_backup() {
 		[[ -n "$sysparent" ]] && rm -rf "$sysparent"
 	fi
 
-	[[ ${#PRODUCED_ARCHIVES[@]} -gt 0 ]] || is_dry
+	is_dry && return 0
+	# Fail the run if NOTHING was produced, OR if any REQUESTED archive failed
+	# (e.g. users failed while system succeeded). Without this, main reports a
+	# partial failure as an overall SUCCESS "Backup complete" notification.
+	[[ ${#PRODUCED_ARCHIVES[@]} -gt 0 ]] || return 1
+	return "$produce_fail"
 }
 
 # ==============================================================================
@@ -733,7 +749,12 @@ deliver_fs() {
 			log "  ERROR: copy failed for ${rel}"; rc=1; continue
 		fi
 		if [[ "$VERIFY_AFTER_CREATE" == "true" ]]; then
-			exp="$(_sha256 "$a")"; act="$(_sha256 "$dst")"
+			# `exp` hashes the local staging copy (fast). `act` reads BACK from the
+			# delivery target, which may be a stale SMB/NFS mount — timeout-bound it
+			# (like verify_file) so a wedged mount can't hang the whole run; a
+			# timeout yields empty act and is treated as a delivery failure below.
+			exp="$(_sha256 "$a")"
+			act=""; [[ -n "$HASH_BIN" ]] && act="$(_with_timeout 600 $HASH_BIN "$dst" 2>/dev/null | awk '{print $1}')"
 			if [[ -z "$act" || "$exp" != "$act" ]]; then
 				log "  ERROR: post-delivery checksum mismatch for ${rel}"; rm -f "$dst"; rc=1; continue
 			fi
@@ -832,11 +853,34 @@ _schedule_invocation() {
 	echo "${script}|${cfg}"
 }
 
+# Map SCHEDULE_DAY ("Sunday", "wed", ...) to a cron/launchd weekday number
+# (0=Sun..6=Sat) and a systemd 3-letter abbreviation. Used only for weekly.
+_dow_num() {
+	case "$(printf '%s' "${1:-Sunday}" | tr '[:upper:]' '[:lower:]')" in
+		sun*) echo 0 ;; mon*) echo 1 ;; tue*) echo 2 ;; wed*) echo 3 ;;
+		thu*) echo 4 ;; fri*) echo 5 ;; sat*) echo 6 ;; *) echo 0 ;;
+	esac
+}
+_dow_abbr() {
+	case "$(_dow_num "$1")" in
+		0) echo Sun ;; 1) echo Mon ;; 2) echo Tue ;; 3) echo Wed ;;
+		4) echo Thu ;; 5) echo Fri ;; 6) echo Sat ;;
+	esac
+}
+
 install_schedule() {
 	local inv script cfg hh mm
 	inv="$(_schedule_invocation)"; script="${inv%%|*}"; cfg="${inv#*|}"
 	hh="${SCHEDULE_TIME%%:*}"; mm="${SCHEDULE_TIME#*:}"
-	log "Installing ${SCHEDULE_CADENCE} schedule at ${SCHEDULE_TIME} (${OS_TYPE})."
+	case "$SCHEDULE_CADENCE" in
+		daily|weekly) ;;
+		*) log "WARN: unknown SCHEDULE_CADENCE='${SCHEDULE_CADENCE}', defaulting to daily."; SCHEDULE_CADENCE="daily" ;;
+	esac
+	if [[ "$SCHEDULE_CADENCE" == "weekly" ]]; then
+		log "Installing weekly schedule on ${SCHEDULE_DAY} at ${SCHEDULE_TIME} (${OS_TYPE})."
+	else
+		log "Installing daily schedule at ${SCHEDULE_TIME} (${OS_TYPE})."
+	fi
 	if [[ "$OS_TYPE" == "macos" ]]; then
 		_install_launchd "$script" "$cfg" "$hh" "$mm"
 	elif command -v systemctl >/dev/null 2>&1; then
@@ -865,6 +909,8 @@ uninstall_schedule() {
 _install_systemd() {
 	local script="$1" cfg="$2" hh="$3" mm="$4"
 	local wake=""; [[ "$SCHEDULE_WAKE" == "true" ]] && wake="WakeSystem=true"
+	local oncal="*-*-* ${hh}:${mm}:00"
+	[[ "$SCHEDULE_CADENCE" == "weekly" ]] && oncal="$(_dow_abbr "$SCHEDULE_DAY") *-*-* ${hh}:${mm}:00"
 	if ! cat >/etc/systemd/system/auto-backupper-client.service 2>/dev/null <<EOF
 [Unit]
 Description=Auto-Backupper desktop client
@@ -877,7 +923,7 @@ EOF
 [Unit]
 Description=Run Auto-Backupper client
 [Timer]
-OnCalendar=*-*-* ${hh}:${mm}:00
+OnCalendar=${oncal}
 Persistent=true
 ${wake}
 [Install]
@@ -888,7 +934,9 @@ EOF
 
 _install_cron() {
 	local script="$1" cfg="$2" hh="$3" mm="$4"
-	local line="${mm##0} ${hh##0} * * * ${script} --backup both --config ${cfg}"
+	local dow="*"
+	[[ "$SCHEDULE_CADENCE" == "weekly" ]] && dow="$(_dow_num "$SCHEDULE_DAY")"
+	local line="${mm##0} ${hh##0} * * ${dow} ${script} --backup both --config ${cfg}"
 	( crontab -l 2>/dev/null | grep -v "auto-backupper-client"; echo "$line" ) | crontab - \
 		&& return 0 || { log "ERROR: cron install failed."; return 1; }
 }
@@ -896,6 +944,8 @@ _install_cron() {
 _install_launchd() {
 	local script="$1" cfg="$2" hh="$3" mm="$4"
 	local plist="/Library/LaunchDaemons/com.auto-backupper.client.plist"
+	local weekday_xml=""
+	[[ "$SCHEDULE_CADENCE" == "weekly" ]] && weekday_xml="<key>Weekday</key><integer>$(_dow_num "$SCHEDULE_DAY")</integer>"
 	if ! cat >"$plist" 2>/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -904,7 +954,7 @@ _install_launchd() {
   <key>ProgramArguments</key><array>
     <string>${script}</string><string>--backup</string><string>both</string>
     <string>--config</string><string>${cfg}</string></array>
-  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>${hh##0}</integer><key>Minute</key><integer>${mm##0}</integer></dict>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>${hh##0}</integer><key>Minute</key><integer>${mm##0}</integer>${weekday_xml}</dict>
   <key>StandardOutPath</key><string>/var/log/auto-backupper-client.log</string>
   <key>StandardErrorPath</key><string>/var/log/auto-backupper-client.log</string>
   <key>RunAtLoad</key><false/>
@@ -1047,7 +1097,15 @@ cmd_restore() {
 # ==============================================================================
 acquire_lock() {
 	# Portable atomic lock via mkdir (flock is Linux-only; macOS lacks it).
-	mkdir -p "$(dirname "$LOCKDIR")" 2>/dev/null || true
+	# Fail LOUDLY if the lock dir's parent can't be made writable — otherwise a
+	# permission failure here returns 1 and main misreports it as "another
+	# instance is running" and exits 0, silently skipping the backup.
+	local _parent; _parent="$(dirname "$LOCKDIR")"
+	if ! mkdir -p "$_parent" 2>/dev/null || [[ ! -w "$_parent" ]]; then
+		log "FATAL: lock directory '$_parent' is not writable; cannot ensure a single instance."
+		log "       Run as root, or point LOCK/STATE at a writable path. Refusing to run blind."
+		exit 1
+	fi
 	if mkdir "$LOCKDIR" 2>/dev/null; then
 		echo $$ >"${LOCKDIR}/pid" 2>/dev/null || true
 		LOCK_HELD=1
@@ -1159,19 +1217,30 @@ main() {
 	# MODE == backup
 	if ! acquire_lock; then log "Another instance is running. Exiting."; exit 0; fi
 	preflight || exit 1
-	if ! produce_backup; then
+	local produce_rc=0 deliver_rc=0
+	produce_backup || produce_rc=$?
+	if [[ ${#PRODUCED_ARCHIVES[@]} -eq 0 ]] && ! is_dry; then
 		log "ERROR: nothing was produced."
 		send_notify "alert" "Backup failed" "${MEMBER}: produce stage created no archives."
 		exit 1
 	fi
-	if deliver_all; then
-		log "SUCCESS: backup complete."
-		send_notify "normal" "Backup complete" "${MEMBER}: ${#PRODUCED_ARCHIVES[@]} archive(s) delivered."
-		exit 0
+	# Deliver whatever DID build, then fold in any per-archive produce failure so
+	# a partial run (e.g. users failed, system succeeded) is never reported as a
+	# clean success.
+	deliver_all || deliver_rc=$?
+	if [[ "$produce_rc" -ne 0 ]]; then
+		log "ERROR: one or more requested archives failed to build."
+		send_notify "alert" "Backup incomplete" "${MEMBER}: a requested archive failed to build (delivered ${#PRODUCED_ARCHIVES[@]}). See ${LOGFILE}."
+		exit 1
 	fi
-	log "ERROR: one or more deliveries failed."
-	send_notify "alert" "Backup delivery failed" "${MEMBER}: see log ${LOGFILE}."
-	exit 1
+	if [[ "$deliver_rc" -ne 0 ]]; then
+		log "ERROR: one or more deliveries failed."
+		send_notify "alert" "Backup delivery failed" "${MEMBER}: see log ${LOGFILE}."
+		exit 1
+	fi
+	log "SUCCESS: backup complete."
+	send_notify "normal" "Backup complete" "${MEMBER}: ${#PRODUCED_ARCHIVES[@]} archive(s) delivered."
+	exit 0
 }
 
 main "$@"
