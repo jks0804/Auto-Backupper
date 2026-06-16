@@ -334,7 +334,13 @@ generate_checksum() {
   # write_checksum — a torn checksum would surface as a false-positive
   # corruption alert on the next verify.
   local tmp="${chk_path}.tmp.$$"
-  if sha256sum "$file" | awk '{print $1}' > "$tmp"; then
+  # Wrap sha256sum in `timeout` (mirrors auto-backupper.sh's write_checksum).
+  # This tool holds the suite-wide /var/lock/auto_backupper.lock for its entire
+  # run, so a wedged NAS/SMB/fuse read here would hang at 0% CPU forever AND keep
+  # watchtower's is_backup_running() true -- standing down every scan/verify/
+  # recovery until manual kill. Bound it (default 1800s); skip the file on
+  # timeout/empty rather than hang.
+  if timeout "${CHECKSUM_TIMEOUT:-1800}" sha256sum "$file" 2>/dev/null | awk '{print $1}' > "$tmp" && [[ -s "$tmp" ]]; then
     mv -f "$tmp" "$chk_path"
     echo "Done."
   else
@@ -350,14 +356,20 @@ generate_checksum() {
 echo "Scanning $TARGET_DIR for legacy archives..."
 
 # Scan for all supported archive types used in your main script
-find "$TARGET_DIR" \
-  -type d -name "${CHECKSUM_DIR}" -prune -o \
-  -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.sql.gz" -o -name "*.archive.gz" -o -name "*.json" -o -name "*.zip" -o -name "*.7z" \) \
-  ! -name "*.sha256" ! -name "*.sha256.tmp.*" ! -name "*_corruption_report.txt" \
-  ! -name "*.part" ! -name "*.partial" ! -name "*.tmp" ! -name "*.tmp.*" \
-  -print0 | while IFS= read -r -d '' file; do
-    generate_checksum "$file" "$TARGET_DIR"
-done
+# Process substitution (not `find | while`) + `|| true`: under set -Eeuo
+# pipefail a bare `find | while` aborts the WHOLE back-fill if find exits
+# non-zero (a file vanishing mid-walk, a flaky mount), silently skipping every
+# un-scanned archive. This way find's exit can't kill the loop.
+while IFS= read -r -d '' file; do
+  generate_checksum "$file" "$TARGET_DIR"
+done < <(
+  find "$TARGET_DIR" \
+    -type d -name "${CHECKSUM_DIR}" -prune -o \
+    -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.sql.gz" -o -name "*.archive.gz" -o -name "*.json" -o -name "*.zip" -o -name "*.7z" \) \
+    ! -name "*.sha256" ! -name "*.sha256.tmp.*" ! -name "*_corruption_report.txt" \
+    ! -name "*.part" ! -name "*.partial" ! -name "*.tmp" ! -name "*.tmp.*" \
+    -print0 2>/dev/null || true
+)
 
 echo "========================================================"
 echo " Operation Complete."
