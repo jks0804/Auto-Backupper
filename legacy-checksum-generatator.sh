@@ -57,8 +57,10 @@ fi
 # ==============================================================================
 # 1. LOCKING MECHANISM (mirrors auto-backupper's lock convention)
 # ==============================================================================
-# We use File Descriptor 9, just like the main script.
-LOCKFD=9
+# Single-instance lock on the SAME lockfile the rest of the suite flocks
+# (auto-backupper / watchtower / restorer). `exec {LOCKFD}>` auto-allocates a
+# free high fd into $LOCKFD — we never hard-code a number (the old `LOCKFD=9`
+# was a no-op, immediately overwritten by the {LOCKFD}> allocation).
 exec {LOCKFD}>"${LOCKFILE}" || { echo "FATAL: Cannot open lockfile."; exit 1; }
 
 echo "Attempting to acquire lock: $LOCKFILE..."
@@ -266,7 +268,10 @@ generate_checksum() {
     return
   fi
 
-  mkdir -p "$chk_dir"
+  # Guard mkdir under set -Eeuo pipefail: a path-component-is-a-file / read-only
+  # fs / ENOSPC failure would otherwise abort the WHOLE back-fill, inconsistent
+  # with this function's per-file non-fatal handling. Skip this file instead.
+  mkdir -p "$chk_dir" || { echo "[SKIP-MKDIR] $name (cannot create $chk_dir)"; return; }
   local chk_path="${chk_dir}/${name}_${discovery_date}.sha256"
 
   # ---- Promotion path ----
@@ -320,8 +325,11 @@ generate_checksum() {
           return
         fi
       else
-        echo "[INVALID-LEGACY] $name: $legacy_source missing usable sha256 — falling through to GEN"
-        # Fall through to fresh generation below.
+        echo "[INVALID-LEGACY] $name: $legacy_source has no usable sha256 — removing it, generating fresh."
+        # Remove the unusable legacy file (no historical hash to preserve) so it
+        # doesn't linger next to the data / re-surface on later runs. GEN below
+        # writes the proper dated checksum.
+        rm -f "$legacy_source" 2>/dev/null || true
       fi
     fi
   fi
