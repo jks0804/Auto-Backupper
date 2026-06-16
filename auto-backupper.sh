@@ -2010,7 +2010,15 @@ EOF
 		/bin/rm -f "${IPC_ERRORS:?}"/*
 
 		local max_jobs="$threads"
-		local current_jobs=0
+		# Track THIS phase's own worker PIDs and wait ONLY on them. A bare
+		# `wait` / `wait -n` (no PID args) reaps every child of the shell —
+		# including the `>(tee … "$LOGFILE")` logging process substitution that
+		# the interactive (`[[ -t 1 ]]`) branch sets up at startup. On bash
+		# versions where `wait` waits for process substitutions, a bare `wait`
+		# here blocks forever on that never-exiting tee — hanging the whole
+		# verify phase on every interactive run. Waiting on explicit worker PIDs
+		# (which `wait PID` supports on all bash versions) avoids it entirely.
+		local -a verify_pids=()
 
 		# Choose the input stream:
 		#  - Full tree: find everything under BACKUP_BASE (skipping .checksums)
@@ -2023,10 +2031,12 @@ EOF
 			log "Phase: Local Verification [${verify_source_desc}] (Threads: $threads) [IPC: $IPC_BASE]"
 			while IFS= read -r -d '' file_to_verify; do
 				(verify_worker_local "$file_to_verify" "$BACKUP_BASE") &
-				current_jobs=$((current_jobs + 1))
-				if [[ $current_jobs -ge $max_jobs ]]; then
-					wait -n 2>/dev/null || wait
-					current_jobs=$((current_jobs - 1))
+				verify_pids+=("$!")
+				# Throttle to max_jobs by waiting on our OLDEST worker (by PID),
+				# never a bare `wait`/`wait -n` (see verify_pids note above).
+				if [[ "${#verify_pids[@]}" -ge "$max_jobs" ]]; then
+					wait "${verify_pids[0]}" 2>/dev/null || true
+					verify_pids=("${verify_pids[@]:1}")
 				fi
 			done < <(find "$BACKUP_BASE" -path "$BACKUP_BASE/${CHECKSUM_DIR}" -prune -o -type f -print0)
 		else
@@ -2043,17 +2053,21 @@ EOF
 					# between creation and verify — shouldn't happen but guard).
 					[[ ! -f "$file_to_verify" ]] && continue
 					(verify_worker_local "$file_to_verify" "$BACKUP_BASE") &
-					current_jobs=$((current_jobs + 1))
-					if [[ $current_jobs -ge $max_jobs ]]; then
-						wait -n 2>/dev/null || wait
-						current_jobs=$((current_jobs - 1))
+					verify_pids+=("$!")
+					if [[ "${#verify_pids[@]}" -ge "$max_jobs" ]]; then
+						wait "${verify_pids[0]}" 2>/dev/null || true
+						verify_pids=("${verify_pids[@]:1}")
 					fi
 				done <"$SESSION_MANIFEST"
 			fi
 		fi
 
-		# Wait for remaining jobs
-		wait
+		# Reap remaining workers by explicit PID — NOT a bare `wait`, which would
+		# block on the >(tee) logging process substitution on some bash versions.
+		if [[ "${#verify_pids[@]}" -gt 0 ]]; then
+			local _vp
+			for _vp in "${verify_pids[@]}"; do wait "$_vp" 2>/dev/null || true; done
+		fi
 
 		# Check Queue for Error Files
 		if [[ -d "$IPC_ERRORS" ]]; then
