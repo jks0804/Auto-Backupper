@@ -676,20 +676,28 @@ produce_backup() {
 	if [[ $do_system -eq 1 ]]; then
 		log "Phase: SYSTEM state archive"
 		local sysparent; sysparent="$(mktemp -d "${TMPDIR:-/tmp}/abclient_sys.XXXXXX" 2>/dev/null || echo "")"
-		local stage="${sysparent}/system"
-		MANIFEST_SOURCES=("(generated system state)")
-		if is_dry; then
-			log "[DRY] collect system state"
-			MANIFEST_STATUS=""; MANIFEST_NOTES=()
-			client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "${stage:-/nonexistent}" .
+		# Guard against mktemp failure: with an empty sysparent, stage would be
+		# "/system" and the real run would tar the FILESYSTEM ROOT (and never clean
+		# it up). Skip the phase and flag failure instead.
+		if ! is_dry && [[ -z "$sysparent" ]]; then
+			log "  ERROR: could not create a system-staging temp dir (mktemp failed); skipping SYSTEM archive."
+			produce_fail=1
 		else
-			collect_system_stage "$stage"
-			client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "$stage" . || produce_fail=1
-			if [[ "$MANIFEST_STATUS" == "SYSTEM_INCOMPLETE" ]]; then
-				send_notify "warning" "System backup incomplete" "${MEMBER}: system archive degraded. Run elevated for a complete capture."
+			local stage="${sysparent}/system"
+			MANIFEST_SOURCES=("(generated system state)")
+			if is_dry; then
+				log "[DRY] collect system state"
+				MANIFEST_STATUS=""; MANIFEST_NOTES=()
+				client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "${stage:-/nonexistent}" .
+			else
+				collect_system_stage "$stage"
+				client_create_archive "$(_member_archive_path systems)" "FamilyBackups/${MEMBER}/systems" -C "$stage" . || produce_fail=1
+				if [[ "$MANIFEST_STATUS" == "SYSTEM_INCOMPLETE" ]]; then
+					send_notify "warning" "System backup incomplete" "${MEMBER}: system archive degraded. Run elevated for a complete capture."
+				fi
 			fi
+			[[ -n "$sysparent" ]] && rm -rf "$sysparent"
 		fi
-		[[ -n "$sysparent" ]] && rm -rf "$sysparent"
 	fi
 
 	is_dry && return 0
@@ -774,20 +782,33 @@ deliver_fs() {
 deliver_ssh() {
 	[[ -n "$RSYNC_SSH_TARGET" ]] || { log "  ERROR: RSYNC_SSH_TARGET not set."; return 1; }
 	if is_dry; then log "[DRY] rsync push -> ${RSYNC_SSH_TARGET}"; return 0; fi
-	local ssh_cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p ${RSYNC_SSH_PORT}"
-	[[ -n "$RSYNC_SSH_IDENTITY" ]] && ssh_cmd="${ssh_cmd} -i ${RSYNC_SSH_IDENTITY}"
+	# Build an ssh CONFIG file rather than inlining `-i $IDENTITY` in rsync's `-e`
+	# string: rsync word-splits the -e value, so an identity PATH WITH SPACES
+	# (e.g. macOS "/Library/Application Support/...") would break. ssh config
+	# quotes the path properly; the temp config's own path (mktemp under TMPDIR)
+	# has no spaces.
+	local sshconf
+	sshconf="$(mktemp "${TMPDIR:-/tmp}/abclient_ssh.XXXXXX" 2>/dev/null)" || { log "  ERROR: could not create ssh config temp."; return 1; }
+	{
+		echo "BatchMode yes"
+		echo "StrictHostKeyChecking accept-new"
+		echo "Port ${RSYNC_SSH_PORT}"
+		echo "ConnectTimeout 30"
+		[[ -n "$RSYNC_SSH_IDENTITY" ]] && printf 'IdentityFile "%s"\n' "$RSYNC_SSH_IDENTITY"
+	} >"$sshconf" 2>/dev/null
 	local rc=0 sub
 	# Data subtree first, then checksums.
 	for sub in shares "$CHECKSUM_DIR"; do
 		[[ -d "${STAGING_BASE}/${sub}" ]] || continue
 		rsync -a --compress --omit-dir-times --partial-dir=.abpartial --timeout=60 \
-			-e "$ssh_cmd" "${STAGING_BASE}/${sub}/" "${RSYNC_SSH_TARGET%/}/${sub}/"
+			-e "ssh -F $sshconf" "${STAGING_BASE}/${sub}/" "${RSYNC_SSH_TARGET%/}/${sub}/"
 		local code=$?
 		if [[ $code -ne 0 && $code -ne 24 ]]; then
 			log "  ERROR: rsync of ${sub}/ failed (code ${code})."
 			rc=1
 		fi
 	done
+	rm -f "$sshconf" 2>/dev/null || true
 	return $rc
 }
 
