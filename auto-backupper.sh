@@ -1107,7 +1107,12 @@ preflight_free_space_check() {
 	# log a warning and continue (estimate becomes a lower bound).
 	local src size
 	for src in "${sources_to_measure[@]}"; do
-		size=$(timeout 120 du -sb "$src" 2>/dev/null | awk '{print $1}')
+		# `|| true`: du routinely prints the total but EXITS NON-ZERO on a live
+		# tree (a file vanishing mid-walk, an unreadable subdir). Under
+		# `set -Eeuo pipefail` that non-zero would propagate out of this bare
+		# assignment and fire the ERR trap, aborting a healthy backup with a
+		# false FATAL. Swallow it; the numeric check below handles a bad result.
+		size=$(timeout 120 du -sb "$src" 2>/dev/null | awk '{print $1}' || true)
 		if [[ -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
 			total_source_bytes=$((total_source_bytes + size))
 		else
@@ -1117,8 +1122,9 @@ preflight_free_space_check() {
 
 	# Destination free space (bytes). -PB1 = POSIX, 1-byte blocks. Works on
 	# every df implementation we care about (coreutils, busybox, etc.).
+	# `|| true` for the same pipefail+ERR-trap reason as du above.
 	local free_bytes
-	free_bytes=$(df -PB1 "$BACKUP_BASE" 2>/dev/null | awk 'NR==2 {print $4}')
+	free_bytes=$(df -PB1 "$BACKUP_BASE" 2>/dev/null | awk 'NR==2 {print $4}' || true)
 	[[ ! "$free_bytes" =~ ^[0-9]+$ ]] && free_bytes=0
 
 	# Human-readable for log output.
@@ -1535,9 +1541,14 @@ verify_worker_pull() {
 # queue they write to. log is called from both verify_worker_pull (for
 # per-file progress) and verify_file (for timeout warnings). All must be
 # exported because xargs -P spawns fresh `bash -c` subshells which only
-# inherit exported names.
-export -f log checksum_find_path checksum_date_from_path verify_file verify_worker_local verify_worker_pull
-export BACKUP_BASE CHECKSUM_DIR IPC_ERRORS CHECKSUM_TIMEOUT
+# inherit exported names. log() internally calls _log_level_for,
+# _log_verbosity_threshold and rotate_log_if_needed (which calls rotate_logs),
+# so those — plus the LOG_* vars they read — must be exported too; otherwise
+# each worker spews "command not found" into the log AND the empty lvl/thresh
+# make ((0<=0)) true, defeating the LOG_VERBOSITY filter for the whole phase.
+export -f log _log_level_for _log_verbosity_threshold rotate_log_if_needed rotate_logs \
+	checksum_find_path checksum_date_from_path verify_file verify_worker_local verify_worker_pull
+export BACKUP_BASE CHECKSUM_DIR IPC_ERRORS CHECKSUM_TIMEOUT LOGFILE LOG_VERBOSITY LOG_MAX_SIZE LOG_BACKUPS
 
 # Compute the rotation date (YYYYMMDD) for a data file. Source-of-truth
 # order: the newest dated checksum's suffix, then mtime as fallback for
@@ -2307,7 +2318,10 @@ pull_flow() {
 					local t_end=$SECONDS
 					local final_corrupt=0
 					if [[ -d "$IPC_ERRORS" ]]; then
-						final_corrupt=$(find "$IPC_ERRORS" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l)
+						# `|| true`: parallel workers may add/remove files in IPC_ERRORS
+						# mid-walk, so find can exit non-zero while wc still prints a
+						# valid count — don't let pipefail+ERR-trap abort the run.
+						final_corrupt=$(find "$IPC_ERRORS" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l || true)
 					fi
 					log "Pull verification hashing complete: $verify_count checked, $final_corrupt corrupt, $((t_end - t_start))s elapsed."
 
