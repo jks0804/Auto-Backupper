@@ -311,6 +311,18 @@ VERIFY_ALL_LOCAL_BACKUPS=false  # Also re-hash the entire BACKUP_BASE tree on ev
 VERIFY_PULLED_BACKUPS=true      # Hash-verify files TRANSFERRED THIS SESSION after pull
 VERIFY_ALL_PULLED_BACKUPS=false # Also re-hash every file in the pulled folders.
                                 # Same tradeoff as VERIFY_ALL_LOCAL_BACKUPS.
+# Timeouts for operations on slow / REMOTE-mounted storage. Remote shares
+# (SMB/NFS, the REMOTE_PULL_SOURCES peers, or any network-backed share in
+# SHARES_TO_BACKUP) are slow to list, open, and read, so these are generous —
+# raise them further for very slow links. They bound a genuinely wedged mount
+# (so the run can't hang forever) without tripping on merely-slow remote I/O.
+CHECKSUM_TIMEOUT=1800           # Max seconds for one sha256sum (create + verify).
+                                # On timeout the file is logged and skipped
+                                # (watchtower stamps it later) instead of hanging.
+RSYNC_TIMEOUT=180               # rsync --timeout: seconds of NO I/O before rsync
+                                # aborts a pull. Slow/remote sources often pause
+                                # longer than the old 60s while building the file
+                                # list — give them headroom before failing.
 BACKUP_SYSTEM=true
 BACKUP_SHARES=true
 
@@ -896,7 +908,7 @@ echo $$ >"$BACKUP_PIDFILE" 2>/dev/null || true
 # source of log bloat. Only include it at debug verbosity. The base
 # options (archive/compress/timeout/etc.) are always present because
 # they affect correctness, not output volume.
-RSYNC_OPTS=(--archive --compress --human-readable --omit-dir-times --update --partial-dir=.abpartial --include="${CHECKSUM_DIR}" --exclude=.abpartial --exclude=.watchtower_state --timeout=60)
+RSYNC_OPTS=(--archive --compress --human-readable --omit-dir-times --update --partial-dir=.abpartial --include="${CHECKSUM_DIR}" --exclude=.abpartial --exclude=.watchtower_state --timeout="${RSYNC_TIMEOUT:-180}")
 if [[ "${LOG_VERBOSITY:-info}" == "debug" ]]; then
 	RSYNC_OPTS+=(--progress)
 fi
@@ -1268,7 +1280,7 @@ write_checksum() {
 	# slow large hash while still capping a true hang. On timeout/failure we log
 	# and return 1; the caller treats a missing checksum as non-fatal (watchtower
 	# stamps it on its next scan), so the run continues instead of stalling.
-	if timeout 1800 sha256sum "$file" 2>/dev/null | awk '{print $1}' >"$tmp" && [[ -s "$tmp" ]]; then
+	if timeout "${CHECKSUM_TIMEOUT:-1800}" sha256sum "$file" 2>/dev/null | awk '{print $1}' >"$tmp" && [[ -s "$tmp" ]]; then
 		mv -f "$tmp" "$chk"
 	else
 		/bin/rm -f "$tmp"
@@ -1305,8 +1317,9 @@ verify_file() {
 	# Wrap sha256sum in `timeout` so a hung filesystem read (stale mount,
 	# disk contention, uninterruptible sleep) fails the verification with
 	# a specific exit code rather than blocking the whole script forever.
-	# 10 minutes is generous for even very large archives on slow disks.
-	act="$(timeout 600 sha256sum "${file}" 2>/dev/null | awk '{print $1}')"
+	# CHECKSUM_TIMEOUT (default 1800s) is generous for large, remote-backed
+	# files; bump it in the cfg for very slow shares.
+	act="$(timeout "${CHECKSUM_TIMEOUT:-1800}" sha256sum "${file}" 2>/dev/null | awk '{print $1}')"
 	if [[ -z "$act" ]]; then
 		log "WARN: sha256sum timed out or failed for ${file}"
 		return 5
@@ -1524,7 +1537,7 @@ verify_worker_pull() {
 # exported because xargs -P spawns fresh `bash -c` subshells which only
 # inherit exported names.
 export -f log checksum_find_path checksum_date_from_path verify_file verify_worker_local verify_worker_pull
-export BACKUP_BASE CHECKSUM_DIR IPC_ERRORS
+export BACKUP_BASE CHECKSUM_DIR IPC_ERRORS CHECKSUM_TIMEOUT
 
 # Compute the rotation date (YYYYMMDD) for a data file. Source-of-truth
 # order: the newest dated checksum's suffix, then mtime as fallback for
