@@ -395,11 +395,17 @@ parse_duration_to_cutoff() {
 	else
 		return 1
 	fi
+	# `date -d "N units ago"` is GNU (Linux/Unraid/OMV — the suite's targets);
+	# BSD/macOS date uses `-v-N{d,m,y}`. Try GNU first, fall back to BSD, so
+	# --prune-checksums works on either. Both failing yields empty output (the
+	# caller rejects an unparseable duration).
+	local g_unit b_unit
 	case "$unit" in
-		d) date -d "${n} days ago"   +%Y%m%d 2>/dev/null ;;
-		m) date -d "${n} months ago" +%Y%m%d 2>/dev/null ;;
-		y) date -d "${n} years ago"  +%Y%m%d 2>/dev/null ;;
+		d) g_unit="days"; b_unit="d" ;;
+		m) g_unit="months"; b_unit="m" ;;
+		y) g_unit="years"; b_unit="y" ;;
 	esac
+	date -d "${n} ${g_unit} ago" +%Y%m%d 2>/dev/null || date -v-"${n}${b_unit}" +%Y%m%d 2>/dev/null
 }
 
 # Format byte count as human-readable with an appropriate unit.
@@ -1446,13 +1452,12 @@ restore)
 	# phase that rm's aged archives. Without this a restore could read an
 	# archive the worker deletes mid-extraction (an operator-initiated restore
 	# is not covered by the cross-host "schedules never overlap" guarantee).
-	# Use a NON-BLOCKING probe (flock -n), not a wait: the worker unlinks its
-	# lockfile while still holding it (anti-stale-inode), so a restore that
-	# waited could win a lock on a now-unlinked inode while the next worker
-	# creates a fresh inode at the path and runs unserialized. Refusing while a
-	# backup is active avoids that race entirely. Open with <> so we never
-	# truncate the worker's lockfile, and hold the FD for the restore's
-	# lifetime so a backup cannot start mid-restore.
+	# Use a NON-BLOCKING probe (flock -n), not a wait: refusing while a backup is
+	# active avoids racing the worker's rotation phase entirely (a waited restore
+	# could begin extracting just as rotation rm's an aged archive). The worker
+	# keeps a PERSISTENT lockfile (flock + no unlink), so opening with <> (never
+	# truncate) and holding the FD for the restore's lifetime cleanly serializes
+	# against it — a backup cannot start mid-restore and vice versa.
 	exec 201<>"/var/lock/auto_backupper.lock"
 	if ! flock -n 201; then
 		echo "ERROR: auto-backupper worker is active (holds its lock); refusing restore to avoid racing rotation. Retry once the backup finishes, or stop it first." >&2
