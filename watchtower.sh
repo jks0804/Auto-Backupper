@@ -2021,18 +2021,36 @@ perform_scan() {
 	fi
 	# ------------------------
 
+	# Track THIS scan's own worker PIDs. The monitor loop backgrounds unrelated
+	# long jobs in the same iteration (run_cleanup_task &, run_docker_update_task
+	# &, run_docker_recovery_task &), so throttling on `jobs -r -p` mis-counts and
+	# a bare `wait` at the end would block on those tasks — delaying "Idle"
+	# status, --status freshness, and CLI-trigger pickup. We throttle and wait on
+	# our own PIDs only.
+	local -a scan_pids=()
 	while IFS= read -r -d '' file; do
 		if [[ "$max_jobs" -gt 1 ]]; then
-			while (($(jobs -r -p | wc -l) >= max_jobs)); do
+			# Gate on our own pending workers; prune finished ones each pass so the
+			# array stays ~max_jobs and the count is accurate.
+			while [[ "${#scan_pids[@]}" -ge "$max_jobs" ]]; do
 				wait -n 2>/dev/null || sleep 0.1
+				local -a _alive=() _p
+				for _p in "${scan_pids[@]}"; do kill -0 "$_p" 2>/dev/null && _alive+=("$_p"); done
+				scan_pids=()
+				[[ "${#_alive[@]}" -gt 0 ]] && scan_pids=("${_alive[@]}")
 			done
 			(process_file "$file" "$base" "$verify_override") &
+			scan_pids+=("$!")
 		else
 			process_file "$file" "$base" "$verify_override"
 		fi
 	done < <(find "$base" \( -path "$base/$CHECKSUM_DIR" -o -name ".abpartial" \) -prune -o -type f -print0)
 
-	if [[ "$max_jobs" -gt 1 ]]; then wait; fi
+	# Wait ONLY for our own workers (never a bare `wait`).
+	if [[ "$max_jobs" -gt 1 && "${#scan_pids[@]}" -gt 0 ]]; then
+		local _wp
+		for _wp in "${scan_pids[@]}"; do wait "$_wp" 2>/dev/null || true; done
+	fi
 	set_status "Idle"
 }
 
