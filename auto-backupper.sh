@@ -503,7 +503,7 @@ _find_loop_for_file() {
 strategy_notify_unraid() {
 	local level="$1" title="$2" message="$3"
 	if [[ -x "/usr/local/emhttp/webGui/scripts/notify" ]]; then
-		/usr/local/emhttp/webGui/scripts/notify -e "$title" -s "Auto-Backupper" -d "$message" -i "$level" >/dev/null 2>&1 || true
+		timeout 15 /usr/local/emhttp/webGui/scripts/notify -e "$title" -s "Auto-Backupper" -d "$message" -i "$level" >/dev/null 2>&1 || true
 	fi
 }
 
@@ -512,13 +512,17 @@ strategy_notify_omv() {
 	local omv_lvl="info"
 	[[ "$level" == "warning" ]] && omv_lvl="warning"
 	[[ "$level" == "alert" ]] && omv_lvl="error"
-	omv-notify -k "${omv_lvl}" -t "${title}" -m "${message}" >/dev/null 2>&1 || true
+	# `timeout` so a wedged omv-notify (it routes through OMV's mail/notification
+	# stack, which can block on SMTP/DNS) can never stall the backup run. The
+	# webhook strategy already bounds itself with curl --max-time; the OS-native
+	# notifiers did not.
+	timeout 15 omv-notify -k "${omv_lvl}" -t "${title}" -m "${message}" >/dev/null 2>&1 || true
 }
 
 strategy_notify_generic() {
 	local level="$1" title="$2" message="$3"
 	if command -v notify-send >/dev/null 2>&1; then
-		notify-send -u "${level}" "${title}" "${message}" >/dev/null 2>&1 || true
+		timeout 15 notify-send -u "${level}" "${title}" "${message}" >/dev/null 2>&1 || true
 	fi
 }
 
@@ -826,11 +830,14 @@ cleanup() {
 	/bin/rm -f "$RUNNING_CONTAINERS_LIST" 2>/dev/null || true
 	/bin/rm -f "$BACKUP_PIDFILE" 2>/dev/null || true
 	/bin/rm -rf "$IPC_BASE" 2>/dev/null || true
-	# Unlink while still holding the flock: a concurrent starter that opens
-	# the file between our unlock and unlink would otherwise acquire a lock
-	# on an inode we're about to delete, letting a third instance open a
-	# fresh file and lock it independently (no mutual exclusion).
-	/bin/rm -f "$LOCKFILE" 2>/dev/null || true
+	# Release the flock but DO NOT unlink the lockfile. Deleting it is the
+	# classic flock race: a second instance that opened the path just before the
+	# unlink (or a new run that re-creates it just after) ends up locking a
+	# DIFFERENT inode than the holder, so two backups run concurrently — and the
+	# loser's cleanup then wipes the winner's IPC tree / PID file, crashing it.
+	# A persistent 0-byte lockfile + flock is the canonical safe pattern (the
+	# same rule watchtower's --stop-backup already documents). The FD closes
+	# automatically on process exit, releasing the lock even on an unclean kill.
 	flock -u "${LOCKFD}" 2>/dev/null || true
 }
 
@@ -1251,10 +1258,21 @@ write_checksum() {
 	# false-positive corruption. The temp+rename pattern guarantees that
 	# the final path either does not exist or holds a complete checksum.
 	local tmp="${chk}.tmp.$$"
-	if sha256sum "$file" | awk '{print $1}' >"$tmp"; then
+	# Wrap sha256sum in `timeout`. This runs right after every archive —
+	# including large FamilyBackups members — so a hung/wedged filesystem read
+	# (stale mount, disk-controller stall) here would otherwise block the whole
+	# produce run indefinitely at 0% CPU with no log line, after the compressor
+	# has already exited. The bound is more generous than verify_file's 600s
+	# because here we hash the full, freshly-written archive (which can be
+	# hundreds of GB) rather than verifying — 1800s tolerates a legitimately
+	# slow large hash while still capping a true hang. On timeout/failure we log
+	# and return 1; the caller treats a missing checksum as non-fatal (watchtower
+	# stamps it on its next scan), so the run continues instead of stalling.
+	if timeout 1800 sha256sum "$file" 2>/dev/null | awk '{print $1}' >"$tmp" && [[ -s "$tmp" ]]; then
 		mv -f "$tmp" "$chk"
 	else
 		/bin/rm -f "$tmp"
+		log "WARN: sha256sum timed out or failed for ${file}"
 		return 1
 	fi
 }
@@ -1393,6 +1411,10 @@ create_archive() {
 			CURRENT_ARCHIVE_FILE=""
 			return 0
 		fi
+		# Heartbeat so a large archive's post-tar hashing isn't mistaken for a
+		# hang: between this and the next "Archiving:" line the script is busy
+		# in write_checksum (now timeout-bounded), not stalled.
+		log "Checksumming: ${archive}"
 		# A failed checksum write leaves a valid archive without its
 		# dated checksum; watchtower stamps it on its next scan. Not a
 		# reason to discard the archive or abort the run.
@@ -1405,8 +1427,8 @@ create_archive() {
 		printf '%s\n' "$archive" >>"$SESSION_MANIFEST"
 		CURRENT_ARCHIVE_FILE=""
 	else
-		log "ERROR: Archive failed: ${archive}"
-		send_notify "alert" "Backup Failed" "${archive}"
+		log "ERROR: Archive failed: ${archive} (tar rc=${tar_rc})"
+		send_notify "alert" "Backup Failed" "${archive} (tar rc=${tar_rc})"
 		rm -f "$archive"
 		CURRENT_ARCHIVE_FILE=""
 		return 1
