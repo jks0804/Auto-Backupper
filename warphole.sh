@@ -1020,6 +1020,22 @@ verify_tailscale_network() {
 	fi
 }
 
+# Return 0 only if FTL DEFINITIVELY reports a populated gravity DB
+# (gravity_size > 0). Unreachable / empty / invalid all return non-zero — we
+# never treat the absence of a positive signal as "healthy". Used by the
+# post-reboot recovery path to confirm a rebuild actually worked before clearing
+# the repair marker (`pihole -g` exits 0 even when blocklists were unreachable
+# and it wiped gravity to empty).
+_gravity_populated() {
+	local _ar=0; authenticate || _ar=$?
+	local _hdr=(); [[ -n "${SID:-}" ]] && _hdr=(-H "X-FTL-SID: $SID")
+	local _resp _gs
+	_resp=$(curl -s --connect-timeout "${API_CONNECT_TIMEOUT:-5}" --max-time 15 \
+		-X GET "$PI_URL/padd" "${_hdr[@]}" 2>/dev/null || true)
+	_gs=$(echo "$_resp" | jq -r '.gravity_size? // empty' 2>/dev/null || echo "")
+	[[ "$_gs" =~ ^[0-9]+$ && "$_gs" -gt 0 ]]
+}
+
 run_health_check() {
 	log "=== Starting Pi-hole Health Check ==="
 
@@ -1056,9 +1072,20 @@ run_health_check() {
 			exit 1
 		fi
 
-		rm -f "$REPAIR_MARKER"
-		log "SUCCESS: Recovery gravity pull complete. Marker removed."
-		return
+		# rc=0 from `pihole -g` does NOT prove success: it exits 0 with an EMPTY
+		# gravity DB when blocklists are unreachable — exactly the persistent
+		# condition that triggered recovery. Clearing the marker here would let
+		# the next --check re-detect gravity_size=0 and reboot again, forever
+		# (the marker reset means the cap never trips). Only clear the marker once
+		# gravity is verified populated; otherwise leave it so the bounded
+		# attempt counter (incremented above) eventually trips into manual mode.
+		if _gravity_populated; then
+			rm -f "$REPAIR_MARKER"
+			log "SUCCESS: Recovery gravity pull complete (gravity populated). Marker removed."
+			return
+		fi
+		log "ERROR: Recovery rebuild exited 0 but gravity is still empty (blocklists likely unreachable). Leaving repair marker (attempt $((_recov_attempts + 1))/${_recov_max}); will stop retrying at the cap rather than reboot-loop."
+		exit 1
 	fi
 	dlog "post-repair-marker check"
 
