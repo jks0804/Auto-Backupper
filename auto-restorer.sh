@@ -1115,8 +1115,14 @@ cmd_restore() {
 
 	# ---- Docker stop ----
 	if [[ "$STOP_DOCKER" == "true" ]]; then
-		docker_stop_for_restore
+		# Arm the EXIT-trap recovery BEFORE stopping. docker_stop_for_restore can
+		# take many seconds (Unraid service stop, container stop timeouts); a
+		# SIGTERM/Ctrl-C during that window would otherwise leave containers
+		# stopped with no auto-restart (the Unraid branch writes no fallback
+		# list). Restart is idempotent, so arming early is safe — leaving Docker
+		# down is the damaging outcome.
 		DOCKER_WAS_STOPPED="true"
+		docker_stop_for_restore
 	fi
 
 	# ---- Extraction ----
