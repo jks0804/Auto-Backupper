@@ -451,7 +451,11 @@ _save_cached_sid() {
 	[[ "$validity" =~ ^[0-9]+$ ]] || validity=1800
 	now=$(date +%s)
 	exp=$((now + validity - 60))
-	tmp="${SID_CACHE_FILE}.tmp.$$"
+	# mktemp (O_EXCL, mode 0600) rather than a predictable ".$$" name:
+	# SID_CACHE_FILE lives in world-writable /tmp, where a predictable temp could
+	# be pre-created as a symlink and the `>` redirect would follow it — a symlink
+	# attack on a bearer credential. mktemp won't follow/clobber an existing path.
+	tmp="$(mktemp "${SID_CACHE_FILE}.tmp.XXXXXX" 2>/dev/null)" || return 0
 	( umask 077; printf '%s\t%s\n' "$sid" "$exp" >"$tmp" ) 2>/dev/null \
 		&& mv -f "$tmp" "$SID_CACHE_FILE" 2>/dev/null \
 		|| { rm -f "$tmp" 2>/dev/null || true; return 0; }
